@@ -1,0 +1,31 @@
+name: pro_pv_wireframe
+description: Production-grade UI wireframe (no business logic) for Episode-based PRO + PV app.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  web_socket_channel: ^3.0.0
+  flutter_pcm_sound: ^1.0.0
+  permission_handler: ^11.3.1
+  logger: ^2.6.2
+  firebase_core: ^4.3.0
+  firebase_analytics: ^12.1.0
+  firebase_crashlytics: ^5.0.6
+  flutter_hooks: ^0.21.3+1
+  hooks_riverpod: ^3.1.0
+  flutter_riverpod: ^3.1.0
+  flutter_sound: ^9.30.0
+  audio_session: ^0.1.21
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true

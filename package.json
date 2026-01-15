@@ -1,0 +1,19 @@
+{
+  "name": "beforedoctor4",
+  "version": "1.0.0",
+  "description": "PRO + PV Production Wireframe (Flutter) — V2 (Design-system + States)",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib",
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google/genai": "^1.35.0"
+  }
+}

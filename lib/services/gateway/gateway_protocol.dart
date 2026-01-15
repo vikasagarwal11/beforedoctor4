@@ -1,0 +1,109 @@
+// lib/services/gateway/gateway_protocol.dart
+//
+// Production gateway protocol for BeforeDoctor Voice Live.
+//
+// Design goals:
+// - Type-safe event mapping
+// - Monotonic sequence numbers for ordering
+// - Patch-based draft updates to avoid UI flicker
+// - Explicit barge-in + emergency signals
+
+import 'dart:convert';
+
+enum GatewayEventType {
+  sessionState,            // server.session.state
+  transcriptPartial,       // server.transcript.partial
+  transcriptFinal,         // server.transcript.final
+  narrativeUpdate,         // server.narrative.update  (string or patch)
+  aeDraftUpdate,           // server.ae_draft.update   (json patch)
+  audioOut,                // server.audio.out        (base64 pcm24k s16le)
+  audioStop,               // server.audio.stop       (barge-in / flush playback)
+  emergency,               // server.triage.emergency
+  error,                   // server.error
+}
+
+/// Canonical envelope: { type: string, payload: object, seq?: int }
+class GatewayEvent {
+  final GatewayEventType type;
+  final Map<String, dynamic> payload;
+  final int seq;
+
+  const GatewayEvent({required this.type, required this.payload, required this.seq});
+
+  static GatewayEvent fromJson(Map<String, dynamic> json) {
+    final t = json['type'] as String? ?? '';
+    final seq = (json['seq'] is num) ? (json['seq'] as num).toInt() : 0;
+
+    return GatewayEvent(
+      type: _mapType(t),
+      payload: (json['payload'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{},
+      seq: seq,
+    );
+  }
+
+  static GatewayEventType _mapType(String t) {
+    switch (t) {
+      case 'server.session.state':
+        return GatewayEventType.sessionState;
+      case 'server.transcript.partial':
+        return GatewayEventType.transcriptPartial;
+      case 'server.transcript.final':
+        return GatewayEventType.transcriptFinal;
+      case 'server.narrative.update':
+        return GatewayEventType.narrativeUpdate;
+      case 'server.ae_draft.update':
+        return GatewayEventType.aeDraftUpdate;
+      case 'server.audio.out':
+        return GatewayEventType.audioOut;
+      case 'server.audio.stop':
+        return GatewayEventType.audioStop;
+      case 'server.triage.emergency':
+        return GatewayEventType.emergency;
+      case 'server.error':
+      default:
+        return GatewayEventType.error;
+    }
+  }
+}
+
+// --------------------- Client → Gateway helpers ---------------------
+
+String clientHello({
+  required String firebaseIdToken,
+  required Map<String, dynamic> sessionConfig,
+}) {
+  return jsonEncode({
+    'type': 'client.hello',
+    'payload': {
+      'firebase_id_token': firebaseIdToken,
+      'session_config': sessionConfig,
+    }
+  });
+}
+
+/// Audio chunk: base64-encoded PCM 16kHz, s16le, mono.
+/// (If you later switch to Opus, lock mimeType and update server.)
+String clientAudioChunk({required String base64Pcm16k}) {
+  return jsonEncode({
+    'type': 'client.audio.chunk',
+    'payload': {'data': base64Pcm16k}
+  });
+}
+
+/// Audio chunk with explicit base64 type (for newer protocol versions).
+/// Gateway accepts both client.audio.chunk and client.audio.chunk.base64 for backward compatibility.
+String clientAudioChunkBase64({required String base64Pcm16k}) {
+  return jsonEncode({
+    'type': 'client.audio.chunk.base64',
+    'payload': {'data': base64Pcm16k}
+  });
+}
+
+String clientStop() {
+  return jsonEncode({'type': 'client.session.stop', 'payload': {}});
+}
+
+/// Optional: client ack when it flushed playback (useful for debugging).
+String clientAudioFlushed() {
+  return jsonEncode({'type': 'client.audio.flushed', 'payload': {}});
+}
