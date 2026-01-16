@@ -16,7 +16,7 @@ else
 fi
 
 echo ""
-cd /Users/ainarai/Desktop/Vikas/beforedoctor4/beforedoctor4/gateway
+cd "$(dirname "$0")/gateway"
 
 echo "📦 Installing gateway dependencies..."
 npm install

@@ -2,7 +2,7 @@
 
 # Start Gateway Server with proper Node.js setup
 
-cd /Users/ainarai/Desktop/Vikas/beforedoctor4/beforedoctor4/gateway
+cd "$(dirname "$0")/gateway"
 
 # Try to load nvm
 export NVM_DIR="$HOME/.nvm"
