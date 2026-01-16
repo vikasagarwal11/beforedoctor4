@@ -75,9 +75,55 @@ class VoiceLiveScreen extends HookConsumerWidget {
         // Permission warm-up: request mic permission at UI level before starting session
         // This improves UX and prevents WebSocket timeouts
         // Note: Request permission even in mock mode since audio engine still needs it
-        final micGranted = await Permission.microphone.request().isGranted;
+        
+        // Check current permission status first
+        final status = await Permission.microphone.status;
+        _logger.info('voice.permission.status', data: {
+          'permission': 'microphone',
+          'status': status.toString(),
+        });
+        
+        bool micGranted = false;
+        PermissionStatus finalStatus = status; // Track final status for logging
+        
+        if (status.isGranted) {
+          micGranted = true;
+          finalStatus = status;
+          _logger.info('voice.permission.already_granted');
+        } else if (status.isDenied) {
+          // Permission not yet requested or was denied - request it
+          _logger.info('voice.permission.requesting');
+          final result = await Permission.microphone.request();
+          micGranted = result.isGranted;
+          finalStatus = result; // Use result status, not initial status
+          _logger.info('voice.permission.request_result', data: {
+            'granted': micGranted,
+            'status': result.toString(),
+          });
+        } else if (status.isPermanentlyDenied) {
+          // Permission was permanently denied - user must enable in Settings
+          // DO NOT auto-open Settings - it backgrounds the app and prevents permission prompt
+          // User can manually open Settings via button in error UI
+          finalStatus = status;
+          _logger.warn('voice.permission.permanently_denied', data: {
+            'permission': 'microphone',
+            'message': 'User must enable microphone in Settings → Privacy & Security → Microphone',
+            'note': 'Not auto-opening Settings to allow OS prompt to appear if status changes',
+          });
+          micGranted = false;
+        } else {
+          // Unknown status - try requesting anyway
+          _logger.warn('voice.permission.unknown_status', data: {'status': status.toString()});
+          final result = await Permission.microphone.request();
+          micGranted = result.isGranted;
+          finalStatus = result; // Use result status
+        }
+        
         if (!micGranted) {
-          _logger.warn('voice.permission.denied_at_ui', data: {'permission': 'microphone'});
+          _logger.warn('voice.permission.denied_at_ui', data: {
+            'permission': 'microphone',
+            'final_status': finalStatus.toString(), // Use tracked final status
+          });
           // Controller will handle the error state when start() is called
         }
 
@@ -180,8 +226,13 @@ class VoiceLiveScreen extends HookConsumerWidget {
   }
 
   Widget _buildTranscriptArea(VoiceSessionController controller) {
-    final partial = controller.transcriptPartial.trim();
-    final finalText = controller.transcriptFinal.trim();
+    // User transcripts (what the user said)
+    final userPartial = controller.userTranscriptPartial.trim();
+    final userFinal = controller.userTranscriptFinal.trim();
+    
+    // Assistant captions (what the assistant is saying)
+    final assistantPartial = controller.assistantCaptionPartial.trim();
+    final assistantFinal = controller.assistantCaptionFinal.trim();
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 18),
@@ -191,22 +242,39 @@ class VoiceLiveScreen extends HookConsumerWidget {
           if (controller.uiState == VoiceUiState.emergency && (controller.emergencyBanner?.isNotEmpty ?? false))
             _EmergencyBanner(text: controller.emergencyBanner!, onDismiss: controller.clearEmergency),
 
+          if (controller.uiState == VoiceUiState.error && (controller.lastError?.isNotEmpty ?? false))
+            _PermissionErrorBanner(
+              error: controller.lastError!,
+              onOpenSettings: () async {
+                await openAppSettings();
+              },
+            ),
+
           const SizedBox(height: 10),
 
-          if (finalText.isNotEmpty)
+          if (userFinal.isNotEmpty ||
+              userPartial.isNotEmpty ||
+              assistantFinal.isNotEmpty ||
+              assistantPartial.isNotEmpty)
             Expanded(
               child: SingleChildScrollView(
-                child: Text(
-                  finalText,
-                  style: const TextStyle(color: Colors.white70, fontSize: 16, height: 1.35),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (userFinal.isNotEmpty)
+                      _Bubble(text: userFinal, alignRight: false, isUser: true),
+                    if (userPartial.isNotEmpty)
+                      _Bubble(text: userPartial, alignRight: false, isUser: true),
+                    if (assistantFinal.isNotEmpty)
+                      _Bubble(text: assistantFinal, alignRight: true, isUser: false),
+                    if (assistantPartial.isNotEmpty)
+                      _Bubble(text: assistantPartial, alignRight: true, isUser: false),
+                  ],
                 ),
               ),
             )
           else
             const Spacer(),
-
-          if (partial.isNotEmpty)
-            _Bubble(text: partial, alignRight: false),
 
           const SizedBox(height: 12),
         ],
@@ -225,9 +293,13 @@ class VoiceLiveScreen extends HookConsumerWidget {
             onPressed: () => _toggleDetails(context, detailsOpen, controller),
           ),
           _DockButton(
-            icon: Icons.mic,
-            onPressed: () {
-              // In V1 we auto-start capture. You can add pause/resume here.
+            icon: controller.isMicMuted ? Icons.mic_off : Icons.mic,
+            onPressed: () async {
+              try {
+                await controller.toggleMic();
+              } catch (e) {
+                _logger.error('voice.mic_toggle_failed', error: e);
+              }
             },
           ),
           _DockButton(
@@ -332,12 +404,14 @@ class _DockButton extends StatelessWidget {
 class _Bubble extends StatelessWidget {
   final String text;
   final bool alignRight;
+  final bool isUser; // true for user speech, false for assistant
 
-  const _Bubble({required this.text, required this.alignRight});
+  const _Bubble({required this.text, required this.alignRight, this.isUser = false});
 
   @override
   Widget build(BuildContext context) {
-    final bg = const Color(0xFF202124);
+    // Different colors for user vs assistant
+    final bg = isUser ? const Color(0xFF1E3A5F) : const Color(0xFF202124);
     return Align(
       alignment: alignRight ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -377,6 +451,69 @@ class _EmergencyBanner extends StatelessWidget {
             onPressed: onDismiss,
             icon: const Icon(Icons.close, color: Colors.white70),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PermissionErrorBanner extends StatelessWidget {
+  final String error;
+  final VoidCallback onOpenSettings;
+
+  const _PermissionErrorBanner({required this.error, required this.onOpenSettings});
+
+  @override
+  Widget build(BuildContext context) {
+    final isPermissionError = error.toLowerCase().contains('microphone') || 
+                              error.toLowerCase().contains('permission');
+    
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.orangeAccent.withOpacity(0.15),
+        border: Border.all(color: Colors.orangeAccent.withOpacity(0.5)),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.mic_off, color: Colors.orangeAccent, size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  isPermissionError 
+                    ? 'Microphone permission required'
+                    : 'Error: $error',
+                  style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+          if (isPermissionError) ...[
+            const SizedBox(height: 8),
+            const Text(
+              'Enable microphone access in Settings → Privacy & Security → Microphone',
+              style: TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: onOpenSettings,
+                icon: const Icon(Icons.settings, size: 16),
+                label: const Text('Open Settings'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.orangeAccent,
+                  side: BorderSide(color: Colors.orangeAccent.withOpacity(0.5)),
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );

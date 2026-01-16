@@ -24,6 +24,7 @@ abstract class IGatewayClient {
   });
 
   Future<void> sendAudioChunkBase64(String base64Pcm16k);
+  Future<void> sendTurnComplete();
   Future<void> sendStop();
   Future<void> close();
 }
@@ -81,6 +82,12 @@ class GatewayClient implements IGatewayClient {
   Future<void> sendAudioChunkBase64(String base64Pcm16k) async {
     if (_channel == null) return;
     _channel!.sink.add(clientAudioChunk(base64Pcm16k: base64Pcm16k));
+  }
+
+  @override
+  Future<void> sendTurnComplete() async {
+    if (_channel == null) return;
+    _channel!.sink.add(clientTurnComplete());
   }
 
   @override

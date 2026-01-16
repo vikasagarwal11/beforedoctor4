@@ -94,7 +94,15 @@ class MockGatewayClient implements IGatewayClient {
       });
     }
     
-    _emit(GatewayEventType.transcriptPartial, {'text': '[mock] receiving audio chunk (${base64Pcm16k.length} b64 chars)'});
+    _emit(GatewayEventType.userTranscriptPartial, {'text': '[mock] receiving audio chunk (${base64Pcm16k.length} b64 chars)'});
+  }
+
+  @override
+  Future<void> sendTurnComplete() async {
+    if (!_connected) return;
+    _logger.info('mock_gateway.turn_complete_received');
+    // In mock mode, turnComplete triggers a final transcript
+    _emit(GatewayEventType.userTranscriptFinal, {'text': '[mock] User finished speaking'});
   }
 
   @override

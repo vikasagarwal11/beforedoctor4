@@ -25,6 +25,10 @@ export const config = {
     nodeEnv: process.env.NODE_ENV || 'development',
     allowedOrigins: process.env.ALLOWED_ORIGINS?.split(',') || ['*'],
   },
+  stt: {
+    enabled: process.env.STT_FALLBACK_ENABLED !== 'false',
+    disableOnVertex: process.env.STT_DISABLE_ON_VERTEX !== 'false',
+  },
 };
 
 // Validate required config

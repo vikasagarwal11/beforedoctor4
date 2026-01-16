@@ -33,6 +33,21 @@ export class GatewayEventHandler {
   }
 
   /**
+   * Handle user transcript (ASR) from Vertex AI
+   */
+  handleUserTranscript(data) {
+    if (data.isPartial) {
+      this.sendEvent('server.user.transcript.partial', {
+        text: data.text,
+      });
+    } else {
+      this.sendEvent('server.user.transcript.final', {
+        text: data.text,
+      });
+    }
+  }
+
+  /**
    * Handle audio output from Vertex AI
    */
   handleAudio(audioBuffer) {
@@ -106,4 +121,3 @@ export class GatewayEventHandler {
 }
 
 export default GatewayEventHandler;
-

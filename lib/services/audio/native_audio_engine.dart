@@ -53,6 +53,7 @@ class _NativeCapture implements IAudioCapture {
   // Buffering state
   final List<int> _audioBuffer = [];
   Timer? _chunkTimer;
+  void Function(Uint8List pcm16k)? _onPcm16kCallback; // Store callback for final flush
   
   // Sample rate detection
   int? _deviceSampleRate;
@@ -78,6 +79,7 @@ class _NativeCapture implements IAudioCapture {
       
       _isCapturing = true;
       _audioBuffer.clear();
+      _onPcm16kCallback = onPcm16k; // Store callback for final flush
 
       _recorder = FlutterSoundRecorder();
       await _recorder!.openRecorder();
@@ -281,19 +283,23 @@ class _NativeCapture implements IAudioCapture {
     _chunkTimer?.cancel();
     _chunkTimer = null;
     
-    // Flush any remaining buffer (send if >= minimum size, otherwise discard)
-    if (_audioBuffer.isNotEmpty) {
-      if (_audioBuffer.length >= _minChunkBytes) {
-        // Send remaining data if it meets minimum size
-        final pcm16k = Uint8List.fromList(_audioBuffer);
-        _audioBuffer.clear();
-        _logger.debug('audio.flushing_remaining_buffer', data: {'bytes': pcm16k.length});
-      } else {
-        // Discard small remaining buffer
-        _logger.debug('audio.discarding_small_buffer', data: {'bytes': _audioBuffer.length});
-        _audioBuffer.clear();
-      }
+    // Flush any remaining buffer - ALWAYS forward it to callback, even if small
+    // This prevents dropping the final 10-20ms of speech
+    if (_audioBuffer.isNotEmpty && _onPcm16kCallback != null) {
+      final pcm16k = Uint8List.fromList(_audioBuffer);
+      _audioBuffer.clear();
+      _logger.debug('audio.flushing_final_buffer', data: {'bytes': pcm16k.length});
+      
+      // Forward final buffer to callback (even if smaller than minChunkBytes)
+      _onPcm16kCallback!(pcm16k);
+    } else if (_audioBuffer.isNotEmpty) {
+      // No callback available, just clear
+      _logger.debug('audio.discarding_final_buffer_no_callback', data: {'bytes': _audioBuffer.length});
+      _audioBuffer.clear();
     }
+    
+    // Clear callback reference
+    _onPcm16kCallback = null;
     
     // Reset sample rate detection state
     _chunkSizeHistory.clear();
@@ -313,6 +319,7 @@ class _NativeCapture implements IAudioCapture {
     _sub = null;
     _recorder = null;
     _streamController = null;
+    _onPcm16kCallback = null;
     
     _logger.info('audio.capture_stopped');
   }

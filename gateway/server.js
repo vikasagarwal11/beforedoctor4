@@ -9,11 +9,28 @@ import { initializeFirebase, verifyFirebaseToken } from './auth.js';
 import { VertexLiveWSSession } from './vertex-live-ws-client.js';
 import { GatewayEventHandler } from './event-handler.js';
 import { SafetyGuardrail } from './safety-guardrail.js';
+import { GoogleStreamingASR } from './stt_streamer.js';
 import { logger } from './logger.js';
 
 // Initialize Firebase and start server
 (async () => {
   await initializeFirebase();
+
+  // Validate Speech-to-Text API if STT fallback is enabled
+  if (config.stt.enabled) {
+    logger.info('stt.validation_starting', {});
+    const sttValid = await GoogleStreamingASR.validateAPI();
+    if (!sttValid) {
+      logger.warn('stt.api_validation_failed_continuing', {
+        note: 'STT fallback may not work - check Speech-to-Text API is enabled in GCP',
+      });
+      // Continue anyway - STT may still work in some cases, or Vertex transcripts will be used
+    } else {
+      logger.info('stt.api_validation_passed', {
+        note: 'Speech-to-Text API is accessible',
+      });
+    }
+  }
   
   // Create WebSocket server
   const wss = new WebSocketServer({
@@ -43,6 +60,17 @@ import { logger } from './logger.js';
     let userId = null;
     let sessionConfig = null;
     let authenticated = false;
+    let stt = null;
+    let sttFallbackEnabled = config.stt.enabled;
+    let sttUsingFallback = config.stt.enabled;
+    
+    // Metrics tracking
+    const metrics = {
+      vertexTranscripts: { partial: 0, final: 0 },
+      sttTranscripts: { partial: 0, final: 0 },
+      emergencyDetections: { vertex: 0, stt: 0 },
+      transcriptSource: 'none', // 'vertex', 'stt', or 'none'
+    };
 
     // Helper to send events in gateway protocol format
     const sendEvent = (type, payload) => {
@@ -111,11 +139,40 @@ import { logger } from './logger.js';
               const safetyGuardrail = new SafetyGuardrail();
 
               vertexSession.on('transcript', (data) => {
-                // Safety Guardrail Loop: Scan for red flags
+                // Assistant transcript (model output)
+                eventHandler.handleTranscript(data);
+              });
+
+              vertexSession.on('userTranscript', (data) => {
+                // If Vertex provides user transcripts, prefer it over fallback STT
+                if (sttUsingFallback) {
+                  sttUsingFallback = false;
+                  metrics.transcriptSource = 'vertex';
+                  logger.session('switching_to_vertex_transcripts', sessionId, userId, {
+                    metrics: {
+                      stt_transcripts_before_switch: metrics.sttTranscripts.partial + metrics.sttTranscripts.final,
+                    },
+                  });
+                  if (config.stt.disableOnVertex && stt) {
+                    stt.stop();
+                    stt = null;
+                  }
+                }
+
+                // Update metrics
+                if (data.isPartial) {
+                  metrics.vertexTranscripts.partial++;
+                } else {
+                  metrics.vertexTranscripts.final++;
+                }
+
+                // Safety Guardrail Loop: Scan USER transcript for red flags
                 const emergency = safetyGuardrail.scan(data.text);
                 if (emergency) {
+                  metrics.emergencyDetections.vertex++;
                   logger.session('emergency_detected', sessionId, userId, {
                     severity: emergency.severity,
+                    source: 'vertex',
                   });
                   sendEvent('server.triage.emergency', {
                     severity: emergency.severity,
@@ -129,10 +186,63 @@ import { logger } from './logger.js';
                     });
                   }
                 }
-                
-                // Continue with normal transcript handling
-                eventHandler.handleTranscript(data);
+
+                eventHandler.handleUserTranscript(data);
               });
+
+              // Start fallback STT stream if enabled
+              if (sttFallbackEnabled) {
+                try {
+                  const languageCode = sessionConfig?.language_code || 'en-US';
+                  stt = new GoogleStreamingASR({ languageCode });
+                  stt.start((sttData) => {
+                    // Only process STT transcripts if we're still using fallback
+                    if (!sttUsingFallback) return;
+                    
+                    // Update metrics
+                    metrics.transcriptSource = 'stt';
+                    if (sttData.isPartial) {
+                      metrics.sttTranscripts.partial++;
+                    } else {
+                      metrics.sttTranscripts.final++;
+                    }
+                    
+                    const emergency = safetyGuardrail.scan(sttData.text);
+                    if (emergency) {
+                      metrics.emergencyDetections.stt++;
+                      logger.session('emergency_detected', sessionId, userId, {
+                        severity: emergency.severity,
+                        source: 'stt_fallback',
+                      });
+                      sendEvent('server.triage.emergency', {
+                        severity: emergency.severity,
+                        banner: emergency.banner,
+                      });
+                      if (emergency.interrupt) {
+                        sendEvent('server.audio.stop', {
+                          reason: 'emergency_interrupt',
+                        });
+                      }
+                    }
+                    eventHandler.handleUserTranscript(sttData);
+                  });
+                  metrics.transcriptSource = 'stt'; // Initial state
+                  logger.session('stt_fallback_started', sessionId, userId, {
+                    language_code: languageCode,
+                  });
+                } catch (error) {
+                  logger.error('stt.fallback_start_failed', {
+                    session_id: sessionId,
+                    user_id: userId,
+                    error_code: error.code,
+                    error_message: error.message,
+                  });
+                  // Continue without STT fallback - Vertex transcripts may still work
+                  sttFallbackEnabled = false;
+                  sttUsingFallback = false;
+                  metrics.transcriptSource = 'vertex'; // Fall back to vertex-only
+                }
+              }
 
               vertexSession.on('audio', (audioBuffer) => {
                 eventHandler.handleAudio(audioBuffer);
@@ -207,6 +317,11 @@ import { logger } from './logger.js';
               
               // Send to Vertex AI
               await vertexSession.sendAudio(pcmBuffer);
+
+              // Also feed fallback STT if enabled and still using it
+              if (sttFallbackEnabled && sttUsingFallback && stt) {
+                stt.write(pcmBuffer);
+              }
               
               // Update state to listening if needed
               sendEvent('server.session.state', { state: 'listening' });
@@ -224,6 +339,32 @@ import { logger } from './logger.js';
             break;
           }
 
+          case 'client.audio.turnComplete': {
+            if (!vertexSession || !authenticated) {
+              logger.warn('gateway.turn_complete_rejected', {
+                session_id: sessionId,
+                reason: !vertexSession ? 'session_not_initialized' : 'not_authenticated',
+              });
+              return;
+            }
+
+            try {
+              await vertexSession.sendTurnComplete();
+              logger.gateway('turn_complete_received', {});
+            } catch (error) {
+              logger.error('gateway.turn_complete_failed', {
+                session_id: sessionId,
+                user_id: userId,
+                error_code: error.code,
+                error_message: error.message,
+              });
+              sendEvent('server.error', {
+                message: `Turn complete error: ${error.message}`,
+              });
+            }
+            break;
+          }
+
           case 'client.session.stop':
           case 'client.stop': {
             // Backward compatibility: accept both client.session.stop and client.stop
@@ -232,6 +373,27 @@ import { logger } from './logger.js';
             if (vertexSession) {
               await vertexSession.close();
             }
+            stt?.stop();
+            
+            // Log session metrics
+            logger.session('session_stopped', sessionId, userId, {
+              metrics: {
+                transcript_source: metrics.transcriptSource,
+                vertex_transcripts: {
+                  partial: metrics.vertexTranscripts.partial,
+                  final: metrics.vertexTranscripts.final,
+                },
+                stt_transcripts: {
+                  partial: metrics.sttTranscripts.partial,
+                  final: metrics.sttTranscripts.final,
+                },
+                emergency_detections: {
+                  vertex: metrics.emergencyDetections.vertex,
+                  stt: metrics.emergencyDetections.stt,
+                },
+                stt_retry_count: stt?.getRetryCount() || 0,
+              },
+            });
             
             sendEvent('server.session.state', { state: 'stopped' });
             ws.close();
@@ -264,6 +426,7 @@ import { logger } from './logger.js';
       if (vertexSession) {
         await vertexSession.close();
       }
+      stt?.stop();
     });
 
     // Handle errors

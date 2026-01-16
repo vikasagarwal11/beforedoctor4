@@ -12,6 +12,8 @@ import 'dart:convert';
 
 enum GatewayEventType {
   sessionState,            // server.session.state
+  userTranscriptPartial,   // server.user.transcript.partial
+  userTranscriptFinal,     // server.user.transcript.final
   transcriptPartial,       // server.transcript.partial
   transcriptFinal,         // server.transcript.final
   narrativeUpdate,         // server.narrative.update  (string or patch)
@@ -45,6 +47,10 @@ class GatewayEvent {
     switch (t) {
       case 'server.session.state':
         return GatewayEventType.sessionState;
+      case 'server.user.transcript.partial':
+        return GatewayEventType.userTranscriptPartial;
+      case 'server.user.transcript.final':
+        return GatewayEventType.userTranscriptFinal;
       case 'server.transcript.partial':
         return GatewayEventType.transcriptPartial;
       case 'server.transcript.final':
@@ -101,6 +107,11 @@ String clientAudioChunkBase64({required String base64Pcm16k}) {
 
 String clientStop() {
   return jsonEncode({'type': 'client.session.stop', 'payload': {}});
+}
+
+/// Signal end of user utterance (turnComplete: true)
+String clientTurnComplete() {
+  return jsonEncode({'type': 'client.audio.turnComplete', 'payload': {}});
 }
 
 /// Optional: client ack when it flushed playback (useful for debugging).

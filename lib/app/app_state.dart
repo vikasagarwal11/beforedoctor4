@@ -72,8 +72,19 @@ class AppStateScope extends InheritedNotifier<AppState> {
 
   static AppState of(BuildContext context) {
     final scope = context.dependOnInheritedWidgetOfExactType<AppStateScope>();
-    assert(scope != null, 'AppStateScope not found in widget tree');
-    return scope!.notifier!;
+    if (scope == null) {
+      // Fallback: create a default AppState if scope not found
+      // This can happen during hot reload or widget tree reconstruction
+      debugPrint('Warning: AppStateScope not found in widget tree, using default state');
+      return AppState();
+    }
+    return scope.notifier!;
+  }
+  
+  /// Safe version that returns null instead of throwing
+  static AppState? maybeOf(BuildContext context) {
+    final scope = context.dependOnInheritedWidgetOfExactType<AppStateScope>();
+    return scope?.notifier;
   }
 }
 

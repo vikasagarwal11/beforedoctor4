@@ -49,6 +49,8 @@
 	<string>This app needs access to your microphone to record voice sessions for health tracking.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>This app needs access to speech recognition to transcribe your voice sessions.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>This app needs access to your local network to connect to the voice gateway server.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

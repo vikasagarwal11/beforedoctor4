@@ -7,8 +7,9 @@ class OfflineBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppStateScope.of(context);
-    if (!state.offline) return const SizedBox.shrink();
+    // Safely access AppStateScope - handle case where it might not be available yet
+    final state = AppStateScope.maybeOf(context);
+    if (state == null || !state.offline) return const SizedBox.shrink();
     final t = Theme.of(context).textTheme;
     return Container(
       margin: const EdgeInsets.only(bottom: AppTokens.md),

@@ -11,7 +11,7 @@ echo ""
 PROJECT_ID="gen-lang-client-0337309484"
 SERVICE_NAME="beforedoctor-gateway"
 REGION="us-central1"
-SERVICE_ACCOUNT="bd-gateway-svc@momsfitnessmojo-dev.iam.gserviceaccount.com"
+SERVICE_ACCOUNT="bd-gateway-svc@gen-lang-client-0337309484.iam.gserviceaccount.com"
 
 echo "📋 Configuration:"
 echo "   Project: $PROJECT_ID"

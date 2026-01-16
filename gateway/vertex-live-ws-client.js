@@ -27,6 +27,7 @@ export class VertexLiveWSSession {
     this.isSetup = false;
     this.eventHandlers = {
       transcript: [],
+      userTranscript: [],
       audio: [],
       bargeIn: [],
       draftUpdate: [],
@@ -263,7 +264,9 @@ export class VertexLiveWSSession {
           generation_config: {
             // Note: language_code is not a valid field in generation_config for Vertex AI Live API
             // Language is handled via system_instruction instead
-            response_modalities: ['AUDIO'],
+            // Request both AUDIO and TEXT so model emits text captions for UI and guardrails
+            // TEXT is required for captions, guardrails, and transcript-driven features
+            response_modalities: ['AUDIO', 'TEXT'],
             speech_config: {
               voice_config: {
                 prebuilt_voice_config: {
@@ -382,6 +385,24 @@ export class VertexLiveWSSession {
           this.emit('bargeIn');
         }
 
+        // Handle user input transcription (ASR)
+        const inputTranscript =
+          message.serverContent.inputTranscription ||
+          message.serverContent.userTranscript ||
+          message.serverContent.userTranscription;
+        if (inputTranscript && inputTranscript.text) {
+          const isFinal = inputTranscript.isFinal ?? inputTranscript.final ?? inputTranscript.is_final;
+          const isPartial = isFinal === undefined ? true : !isFinal;
+          logger.vertexAI('user_transcript_received', {
+            has_transcript: true,
+            is_partial: isPartial,
+          });
+          this.emit('userTranscript', {
+            text: inputTranscript.text,
+            isPartial: isPartial,
+          });
+        }
+
         // Handle model turn (audio + text output)
         if (message.serverContent.modelTurn) {
           const parts = message.serverContent.modelTurn.parts || [];
@@ -412,19 +433,23 @@ export class VertexLiveWSSession {
 
             // Handle function calls (tool calls for draft updates)
             if (part.functionCall) {
+              const functionCallId = part.functionCall.id || null;
               logger.vertexAI('function_call_received', {
                 function_name: part.functionCall.name,
+                has_call_id: !!functionCallId,
               });
 
               if (part.functionCall.name === 'update_ae_draft') {
                 const args = part.functionCall.args || {};
                 this.emit('draftUpdate', args);
+                this.sendFunctionResponse(part.functionCall.name, { status: 'ok' }, functionCallId);
               }
 
               if (part.functionCall.name === 'update_narrative') {
                 const args = part.functionCall.args || {};
                 if (args.narrative) {
                   this.emit('narrativeUpdate', { text: args.narrative });
+                  this.sendFunctionResponse(part.functionCall.name, { status: 'ok' }, functionCallId);
                 }
               }
             }
@@ -500,6 +525,85 @@ export class VertexLiveWSSession {
   }
 
   /**
+   * Send function response (tool call acknowledgement)
+   * @param {string} name - Function name that was called
+   * @param {object} response - Function response/result data
+   * @param {string} functionCallId - Optional function call ID to match response to call
+   */
+  async sendFunctionResponse(name, response, functionCallId = null) {
+    if (!this.ws || !this.isConnected || !this.isSetup) {
+      return;
+    }
+
+    try {
+      const responseMessage = {
+        clientContent: {
+          turns: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  functionResponse: {
+                    name: name,
+                    response: response || {},
+                    ...(functionCallId && { id: functionCallId }),
+                  },
+                },
+              ],
+            },
+          ],
+          // Don't set turnComplete: true here - function responses should not end the turn
+          // The model will continue processing after receiving the response
+          turnComplete: false,
+        },
+      };
+
+      this.ws.send(JSON.stringify(responseMessage));
+      logger.vertexAI('function_response_sent', { 
+        function_name: name,
+        has_call_id: !!functionCallId,
+      });
+    } catch (error) {
+      logger.error('vertex.function_response_failed', {
+        error_code: error.code,
+        error_message: error.message,
+        function_name: name,
+      });
+    }
+  }
+
+  /**
+   * Signal end of user utterance (turnComplete: true)
+   * This tells the model that the user has finished speaking and it should process and respond
+   */
+  async sendTurnComplete() {
+    if (!this.ws || !this.isConnected || !this.isSetup) {
+      throw new Error('Session not ready - WebSocket not connected or setup not complete');
+    }
+
+    try {
+      // Send turnComplete message (empty turn with turnComplete: true)
+      const turnCompleteMessage = {
+        clientContent: {
+          turns: [],
+          turnComplete: true,
+        },
+      };
+
+      this.ws.send(JSON.stringify(turnCompleteMessage));
+      
+      logger.vertexAI('turn_complete_sent', {});
+
+    } catch (error) {
+      logger.error('vertex.turn_complete_send_failed', {
+        error_code: error.code,
+        error_message: error.message,
+      });
+      this.emit('error', error);
+    }
+  }
+
+  /**
    * Event emitter pattern
    */
   on(event, handler) {
@@ -551,5 +655,4 @@ export class VertexLiveWSSession {
 }
 
 export default VertexLiveWSSession;
-
 

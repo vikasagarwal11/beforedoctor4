@@ -18,6 +18,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google-cloud/speech": "^6.6.0",
     "@google-cloud/secret-manager": "^5.6.0",
     "@google-cloud/vertexai": "^1.0.0",
     "@google/generative-ai": "^0.21.0",

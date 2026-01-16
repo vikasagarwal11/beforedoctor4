@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../features/library/screens/library_screen.dart';
@@ -41,12 +43,29 @@ class _AppShellState extends State<AppShell> {
       state: _state,
       child: AppStateBuilder(builder: (context, state) {
         final mq = MediaQuery.of(context);
+        final firebaseIdToken = 'mock_token_for_testing'; // Replace with real Firebase token in production
+        
+        // Determine gateway URL based on platform
+        // - Physical iOS device: Use Mac's IP (192.168.5.10 - update if your IP changes)
+        // - Simulator: Use localhost
+        // - Android emulator: Use 10.0.2.2
+        final gatewayUrl = Platform.isAndroid
+            ? 'ws://10.0.2.2:8080'
+            : 'ws://192.168.5.10:8080'; // Your Mac's IP for physical device (localhost for simulator)
+        
+        // Allow real gateway even with mock token for development
+        // Set to false to force real audio (requires gateway server running)
+        final useMockGateway = false; // Set to true for UI testing without gateway
+        
         final pages = [
         HomeScreen(repo: widget.repo, activeProfile: _activeProfile, onProfileChange: _setProfile),
         // Use VoiceLiveScreen (new Gemini Live-style UI) instead of VoiceScreen (old Teddy Buddy UI)
         VoiceLiveScreen(
-          gatewayUrl: Uri.parse('ws://10.0.2.2:8080'), // Local gateway server (10.0.2.2 = host machine from Android emulator)
-          firebaseIdToken: 'mock_token_for_testing', // Replace with real Firebase token in production
+          gatewayUrl: Uri.parse(gatewayUrl),
+          // TODO: Replace with real Firebase authentication token from your auth service
+          // Example: firebaseIdToken: FirebaseAuth.instance.currentUser?.getIdToken() ?? '',
+          // For development, the gateway accepts mock tokens, but production requires real auth.
+          firebaseIdToken: firebaseIdToken,
           sessionConfig: {
             'patient_ref': _activeProfile.id,
             'reporter_ref': _activeProfile.id,
@@ -56,7 +75,7 @@ class _AppShellState extends State<AppShell> {
               'text': 'You are a helpful clinical assistant for adverse event reporting.',
             },
           },
-          useMockGateway: false, // Set to false when gateway server is running
+          useMockGateway: useMockGateway, // Use mock gateway when running with a mock token
         ),
         LibraryScreen(repo: widget.repo, profile: _activeProfile),
         InsightsScreen(repo: widget.repo, profile: _activeProfile),
