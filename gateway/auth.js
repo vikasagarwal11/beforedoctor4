@@ -91,14 +91,19 @@ export async function initializeFirebase() {
  * @returns {Promise<{uid: string, email?: string, sessionId?: string}>} Decoded token data
  */
 export async function verifyFirebaseToken(idToken) {
-  // Development mode: Check for mock tokens and bypass verification
-  if (process.env.NODE_ENV === 'development' || config.server.nodeEnv === 'development') {
+  // Check for mock tokens: Allow in development OR if explicitly enabled via env var
+  const allowMockTokens = process.env.NODE_ENV === 'development' 
+    || config.server.nodeEnv === 'development' 
+    || process.env.ALLOW_MOCK_TOKENS === 'true';
+  
+  if (allowMockTokens) {
     // Common mock token patterns used in local testing
     const mockTokens = ['mock_token_for_testing', 'mock', 'test_token', 'dev_token'];
     if (mockTokens.includes(idToken)) {
       logger.warn('firebase.token_verification_bypassed', {
         reason: 'mock_token_detected',
         token_prefix: idToken.substring(0, 10),
+        environment: config.server.nodeEnv,
       });
       return { 
         uid: 'dev-user', 

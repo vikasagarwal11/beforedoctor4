@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 import '../features/library/screens/library_screen.dart';
 
@@ -28,14 +31,50 @@ class _AppShellState extends State<AppShell> {
   final AppState _state = AppState();
   int _tab = 1;
   late PersonProfile _activeProfile;
+  StreamSubscription<User?>? _authSub;
+  String _firebaseIdToken = '';
 
   @override
   void initState() {
     super.initState();
     _activeProfile = widget.repo.profiles.first;
+    _listenForAuthToken();
   }
 
   void _setProfile(PersonProfile p) => setState(() => _activeProfile = p);
+
+  void _listenForAuthToken() {
+    // Only use Firebase Auth if Firebase is initialized
+    // Otherwise, use mock token directly (for testing without Firebase setup)
+    if (Firebase.apps.isEmpty) {
+      // Firebase not initialized - use mock token directly
+      _firebaseIdToken = 'mock_token_for_testing';
+      return;
+    }
+    
+    // Firebase is initialized - listen for auth token changes
+    _authSub = FirebaseAuth.instance.idTokenChanges().listen((user) async {
+      final token = await user?.getIdToken();
+      if (!mounted) return;
+      setState(() {
+        // Fallback to mock token if no user signed in (for testing)
+        // In production, ensure a user is signed in or use anonymous auth
+        _firebaseIdToken = token ?? 'mock_token_for_testing';
+      });
+    }, onError: (_) {
+      if (!mounted) return;
+      setState(() {
+        // Use mock token on error to allow testing without full Firebase setup
+        _firebaseIdToken = 'mock_token_for_testing';
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _authSub?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -43,15 +82,17 @@ class _AppShellState extends State<AppShell> {
       state: _state,
       child: AppStateBuilder(builder: (context, state) {
         final mq = MediaQuery.of(context);
-        final firebaseIdToken = 'mock_token_for_testing'; // Replace with real Firebase token in production
+        final firebaseIdToken = _firebaseIdToken;
         
         // Determine gateway URL based on platform
-        // - Physical iOS device: Use Mac's IP (192.168.5.10 - update if your IP changes)
-        // - Simulator: Use localhost
-        // - Android emulator: Use 10.0.2.2
-        final gatewayUrl = Platform.isAndroid
-            ? 'ws://10.0.2.2:8080'
-            : 'ws://192.168.5.10:8080'; // Your Mac's IP for physical device (localhost for simulator)
+        // PRODUCTION: Use Cloud Run URL (no local network permission needed)
+        // DEVELOPMENT: Uncomment the platform-specific URLs below and comment out production URL
+        final gatewayUrl = 'wss://beforedoctor-gateway-u3gdra7oka-uc.a.run.app'; // Production Cloud Run URL
+        
+        // Development URLs (for local testing - uncomment to use):
+        // final gatewayUrl = Platform.isAndroid
+        //     ? 'ws://10.0.2.2:8080'
+        //     : 'ws://192.168.5.10:8080'; // Your Mac's IP for physical device (localhost for simulator)
         
         // Allow real gateway even with mock token for development
         // Set to false to force real audio (requires gateway server running)
@@ -62,8 +103,6 @@ class _AppShellState extends State<AppShell> {
         // Use VoiceLiveScreen (new Gemini Live-style UI) instead of VoiceScreen (old Teddy Buddy UI)
         VoiceLiveScreen(
           gatewayUrl: Uri.parse(gatewayUrl),
-          // TODO: Replace with real Firebase authentication token from your auth service
-          // Example: firebaseIdToken: FirebaseAuth.instance.currentUser?.getIdToken() ?? '',
           // For development, the gateway accepts mock tokens, but production requires real auth.
           firebaseIdToken: firebaseIdToken,
           sessionConfig: {

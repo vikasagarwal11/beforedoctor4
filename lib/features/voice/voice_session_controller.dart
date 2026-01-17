@@ -76,8 +76,8 @@ class VoiceSessionController extends ChangeNotifier {
   // --- Audio backpressure: bounded queue + timed drain (drop-oldest) ---
   static const int _chunkMs = 20; // 20ms chunks from audio engine
 
-  // Keep at most ~1.2s buffered. Tune: 800–1500ms is usually a good UX tradeoff.
-  static const int _maxQueuedMs = 1200;
+  // Keep at most ~0.8s buffered to favor real-time latency.
+  static const int _maxQueuedMs = 800;
   static const int _maxQueuedChunks = _maxQueuedMs ~/ _chunkMs;
   static const int _maxConsecutiveDrainErrors = 5;
 
@@ -96,9 +96,9 @@ class VoiceSessionController extends ChangeNotifier {
   bool _playbackStarted = false; // True once initial buffer is filled
   bool _playbackDrainInProgress = false; // Single-flight guard to prevent overlapping async feeds
 
-  static const int _playbackStartBufferMs = 200; // 150-250ms typical prebuffer
+  static const int _playbackStartBufferMs = 120; // Lower prebuffer for faster first audio
   static const int _playbackDrainEveryMs = 20; // Match 20ms chunks
-  static const int _maxPlaybackBufferedMs = 1200; // Cap to ~1.2s (prefer real-time over lag)
+  static const int _maxPlaybackBufferedMs = 800; // Cap to ~0.8s (prefer real-time over lag)
 
   VoiceSessionController({
     required this.gateway,

@@ -25,6 +25,9 @@ export class VertexLiveWSSession {
     this.accessToken = null;
     this.isConnected = false;
     this.isSetup = false;
+    this.lastError = null;
+    this.audioSendCounter = 0;
+    this.audioReceiveCounter = 0;
     this.eventHandlers = {
       transcript: [],
       userTranscript: [],
@@ -117,6 +120,8 @@ export class VertexLiveWSSession {
         throw new Error('Not initialized - call initialize() first');
       }
 
+      this.lastError = null;
+
       // Build WebSocket URL
       const location = config.vertexAI.location;
       const wsUrl = `wss://${location}-aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent`;
@@ -132,6 +137,7 @@ export class VertexLiveWSSession {
           'Authorization': `Bearer ${this.accessToken}`,
           'Content-Type': 'application/json',
         },
+        perMessageDeflate: false,
       });
 
       // Handle connection open
@@ -195,9 +201,15 @@ export class VertexLiveWSSession {
       await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error('Setup message timeout'));
-        }, 5000);
+        }, 15000);
 
         const checkSetup = setInterval(() => {
+          if (this.lastError) {
+            clearTimeout(timeout);
+            clearInterval(checkSetup);
+            reject(this.lastError);
+            return;
+          }
           if (this.isSetup) {
             clearTimeout(timeout);
             clearInterval(checkSetup);
@@ -277,10 +289,8 @@ export class VertexLiveWSSession {
             temperature: 0.7,
             top_p: 0.95,
             top_k: 40,
-            // Context window compression for long sessions (native audio accumulates ~25 tokens/sec)
-            context_window_compression_config: {
-              compression_ratio: 0.5, // Compress to 50% to prevent token overflow in long sessions
-            },
+            // Note: context_window_compression_config is not supported in Vertex AI Live API
+            // Context management is handled automatically by the service
           },
           system_instruction: {
             parts: [
@@ -411,10 +421,14 @@ export class VertexLiveWSSession {
             // Handle audio output (24kHz PCM)
             if (part.inlineData && part.inlineData.mimeType?.includes('audio')) {
               const audioData = Buffer.from(part.inlineData.data, 'base64');
-              logger.vertexAI('audio_received', {
-                has_audio: true,
-                audio_size_bytes: audioData.length,
-              });
+              this.audioReceiveCounter++;
+              if (this.audioReceiveCounter % 25 === 0) {
+                logger.vertexAI('audio_received', {
+                  has_audio: true,
+                  audio_size_bytes: audioData.length,
+                  total_received: this.audioReceiveCounter,
+                });
+              }
               this.emit('audio', audioData);
             }
 
@@ -459,6 +473,7 @@ export class VertexLiveWSSession {
 
       // Handle errors
       if (message.error) {
+        this.lastError = new Error(message.error.message || 'Vertex API error');
         logger.error('vertex.api_error', {
           error_code: message.error.code,
           error_message: message.error.message,
@@ -488,10 +503,14 @@ export class VertexLiveWSSession {
       const audioBase64 = pcm16k.toString('base64');
 
       // Log audio chunk sent (no audio content)
-      logger.vertexAI('audio_chunk_sent', {
-        chunk_size_bytes: pcm16k.length,
-        has_audio: true,
-      });
+      this.audioSendCounter++;
+      if (this.audioSendCounter % 25 === 0) {
+        logger.vertexAI('audio_chunk_sent', {
+          chunk_size_bytes: pcm16k.length,
+          has_audio: true,
+          total_sent: this.audioSendCounter,
+        });
+      }
 
       // Send audio input message
       const inputMessage = {
@@ -655,4 +674,3 @@ export class VertexLiveWSSession {
 }
 
 export default VertexLiveWSSession;
-
