@@ -314,6 +314,11 @@ export class VertexLiveWSSession {
           },
           // Enable transcription for both input (user speech) and output (model audio)
           // This allows us to get text transcripts even though responseModalities only has AUDIO
+          inputAudioConfig: {
+            sampleRateHertz: 16000,
+            encoding: 'LINEAR16',
+            audioChannelCount: 1,
+          },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
           tools: [
@@ -598,7 +603,7 @@ export class VertexLiveWSSession {
                 {
                   inlineData: {
                     data: audioBase64,
-                    mimeType: 'audio/pcm;rate=16000',
+                    mimeType: 'audio/pcm',
                   },
                 },
               ],
