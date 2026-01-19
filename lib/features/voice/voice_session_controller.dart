@@ -497,7 +497,15 @@ class VoiceSessionController extends ChangeNotifier {
   }
 
   void _onGatewayEvent(GatewayEvent ev) async {
-    // Only log errors and state changes, not every event
+    // Diagnostic: Log ALL events to debug server_ready issue
+    _logger.info('voice.gateway_event_received_DEBUG', data: {
+      'event_type': ev.type.toString(),
+      'sequence': ev.seq,
+      'payload_keys': ev.payload.keys.toList(),
+      'server_ready_before': _serverReady,
+      'session_started': _sessionStarted,
+    });
+    
     // Sequence gap detection and ordering guard
     if (ev.seq != 0) {
       // Drop out-of-order events
@@ -525,6 +533,11 @@ class VoiceSessionController extends ChangeNotifier {
     switch (ev.type) {
       case GatewayEventType.sessionState: {
         final state = ev.payload['state'] as String? ?? '';
+        _logger.info('voice.sessionState_event_DEBUG', data: {
+          'state': state,
+          'session_started': _sessionStarted,
+          'server_ready_before': _serverReady,
+        });
         if (state == 'listening') {
           _logger.info('voice.server_listening_state_received', data: {
             'current_session_started': _sessionStarted,
@@ -532,6 +545,7 @@ class VoiceSessionController extends ChangeNotifier {
           });
           _setState(VoiceUiState.listening);
           _serverReady = true;
+          _logger.info('voice.server_ready_SET_TO_TRUE_DEBUG');
           // Start mic capture now that server is ready
           _startMicCaptureIfNeeded();
         }
