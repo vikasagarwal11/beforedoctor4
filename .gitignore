@@ -49,5 +49,19 @@ app.*.map.json
 .env.local
 .env.*.local
 
-# Documentation files
+# Firebase configuration files (contain sensitive API keys)
+**/GoogleService-Info.plist
+**/google-services.json
+**/*-service-account.json
+**/service-account-key.json
+
+# Documentation files (not pushed to GitHub)
 *.md
+
+# Archive files
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z

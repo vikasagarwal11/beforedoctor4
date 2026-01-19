@@ -28,6 +28,7 @@ export class VertexLiveWSSession {
     this.lastError = null;
     this.audioSendCounter = 0;
     this.audioReceiveCounter = 0;
+    this._hasLoggedRawMessage = false;
     this.eventHandlers = {
       transcript: [],
       userTranscript: [],
@@ -166,6 +167,11 @@ export class VertexLiveWSSession {
           code: code,
           reason: reason?.toString(),
         });
+        if (!this.isSetup) {
+          this.lastError = new Error(
+            `WebSocket closed before setup complete (code ${code})`
+          );
+        }
         this.isConnected = false;
         this.isSetup = false;
       });
@@ -217,11 +223,19 @@ export class VertexLiveWSSession {
           }
         }, 100);
 
-        this.ws.once('error', (error) => {
+        const onError = (error) => {
           clearTimeout(timeout);
           clearInterval(checkSetup);
           reject(error);
-        });
+        };
+        const onClose = (code) => {
+          clearTimeout(timeout);
+          clearInterval(checkSetup);
+          reject(new Error(`WebSocket closed before setup complete (code ${code})`));
+        };
+
+        this.ws.once('error', onError);
+        this.ws.once('close', onClose);
       });
 
       logger.info('vertex.session_started', {
@@ -272,36 +286,39 @@ export class VertexLiveWSSession {
 
       const setupMessage = {
         setup: {
-          model: `projects/${config.vertexAI.projectId}/locations/${config.vertexAI.location}/publishers/google/models/gemini-2.5-flash-native-audio`,
-          generation_config: {
-            // Note: language_code is not a valid field in generation_config for Vertex AI Live API
-            // Language is handled via system_instruction instead
-            // Request both AUDIO and TEXT so model emits text captions for UI and guardrails
-            // TEXT is required for captions, guardrails, and transcript-driven features
-            response_modalities: ['AUDIO', 'TEXT'],
-            speech_config: {
-              voice_config: {
-                prebuilt_voice_config: {
-                  voice_name: 'Puck', // Professional, empathetic voice
+          model: `projects/${config.vertexAI.projectId}/locations/${config.vertexAI.location}/publishers/google/models/${config.vertexAI.model}`,
+          generationConfig: {
+            // Note: Only one response modality can be specified
+            // Use AUDIO for audio output, then enable outputAudioTranscription for text transcripts
+            // Language is handled via systemInstruction instead of language_code
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: 'Puck', // Professional, empathetic voice
                 },
               },
             },
             temperature: 0.7,
-            top_p: 0.95,
-            top_k: 40,
+            topP: 0.95,
+            topK: 40,
             // Note: context_window_compression_config is not supported in Vertex AI Live API
             // Context management is handled automatically by the service
           },
-          system_instruction: {
+          systemInstruction: {
             parts: [
               {
                 text: systemInstruction,
               },
             ],
           },
+          // Enable transcription for both input (user speech) and output (model audio)
+          // This allows us to get text transcripts even though responseModalities only has AUDIO
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
           tools: [
             {
-              function_declarations: [
+              functionDeclarations: [
                 {
                   name: 'update_ae_draft',
                   description: 'Update the adverse event report draft with extracted information',
@@ -364,7 +381,15 @@ export class VertexLiveWSSession {
         model: setupMessage.setup.model,
         language_code: languageCode,
         has_tools: setupMessage.setup.tools.length > 0,
-        has_compression: !!setupMessage.setup.generation_config.context_window_compression_config,
+        has_compression: !!setupMessage.setup.generationConfig?.context_window_compression_config,
+      });
+      // Log raw setup message for debugging (truncated for size)
+      logger.info('vertex.setup_message_raw', {
+        message_preview: JSON.stringify(setupMessage).substring(0, 200),
+        model: setupMessage.setup.model,
+        has_generationConfig: !!setupMessage.setup.generationConfig,
+        has_systemInstruction: !!setupMessage.setup.systemInstruction,
+        has_tools: setupMessage.setup.tools.length > 0,
       });
 
     } catch (error) {
@@ -380,8 +405,43 @@ export class VertexLiveWSSession {
    */
   _handleVertexMessage(message) {
     try {
-      // Handle setup response
-      if (message.setupComplete) {
+      // Log raw message for debugging (first message only or on errors)
+      if (!this._hasLoggedRawMessage || message.error) {
+        logger.info('vertex.raw_message_received', {
+          message_keys: Object.keys(message),
+          has_setupComplete: !!message.setupComplete,
+          has_setup_complete: !!message.setup_complete,
+          has_setupCompleted: !!message.setupCompleted,
+          has_BidiGenerateContentSetupComplete: !!message.BidiGenerateContentSetupComplete,
+          has_bidiGenerateContentSetupComplete: !!message.bidiGenerateContentSetupComplete,
+          has_error: !!message.error,
+          has_status: !!message.status,
+          has_serverContent: !!message.serverContent,
+          message_preview: JSON.stringify(message).substring(0, 300),
+        });
+        this._hasLoggedRawMessage = true;
+      }
+
+      // Handle errors or status messages from Vertex AI
+      if (message.error || message.status) {
+        const errorMessage = message.error?.message || message.status?.message || message.error || message.status || 'Vertex returned an error during setup';
+        this.lastError = new Error(errorMessage);
+        logger.error('vertex.server_error_message', {
+          message_keys: Object.keys(message),
+          error: message.error,
+          status: message.status,
+          error_message: errorMessage,
+        });
+        this.emit('error', this.lastError);
+        return;
+      }
+
+      // Handle setup response - check multiple possible field names
+      if (message.setupComplete || 
+          message.setup_complete || 
+          message.setupCompleted ||
+          message.BidiGenerateContentSetupComplete ||
+          message.bidiGenerateContentSetupComplete) {
         logger.info('vertex.setup_complete', {});
         this.isSetup = true;
         return;
@@ -471,7 +531,23 @@ export class VertexLiveWSSession {
         }
       }
 
-      // Handle errors
+      // Log unrecognized message shapes (for debugging setup issues)
+      // Only log if we haven't handled it above (not setupComplete, not serverContent, not error)
+      if (!message.setupComplete && 
+          !message.setup_complete && 
+          !message.setupCompleted &&
+          !message.BidiGenerateContentSetupComplete &&
+          !message.bidiGenerateContentSetupComplete &&
+          !message.serverContent && 
+          !message.error &&
+          !message.status) {
+        logger.warn('vertex.unhandled_message', {
+          message_keys: Object.keys(message),
+          message_preview: JSON.stringify(message).substring(0, 500),
+        });
+      }
+
+      // Handle errors (duplicate check - this is for runtime errors not caught earlier)
       if (message.error) {
         this.lastError = new Error(message.error.message || 'Vertex API error');
         logger.error('vertex.api_error', {

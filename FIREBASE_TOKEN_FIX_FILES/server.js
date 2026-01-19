@@ -115,14 +115,6 @@ import { logger } from './logger.js';
         switch (message.type) {
           case 'client.hello': {
             try {
-              // Diagnostic logging: Check what we received
-              logger.info('gateway.client_hello_received', {
-                has_payload: !!message.payload,
-                has_token: !!(message.payload?.firebase_id_token),
-                token_length: message.payload?.firebase_id_token?.length || 0,
-                has_session_config: !!(message.payload?.session_config),
-              });
-              
               // Verify Firebase token
               const tokenData = await verifyFirebaseToken(
                 message.payload.firebase_id_token
@@ -286,15 +278,10 @@ import { logger } from './logger.js';
               logger.session('session_ready', sessionId, userId, {});
 
             } catch (error) {
-              // Enhanced error logging with stack trace in development
               logger.error('gateway.session_init_failed', {
                 session_id: sessionId,
                 error_code: error.code,
                 error_message: error.message,
-                error_stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
-                has_payload: !!message.payload,
-                has_token: !!(message.payload?.firebase_id_token),
-                token_length: message.payload?.firebase_id_token?.length || 0,
               });
               sendEvent('server.error', {
                 message: `Failed to initialize session: ${error.message}`,

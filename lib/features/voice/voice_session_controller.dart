@@ -148,12 +148,22 @@ class VoiceSessionController extends ChangeNotifier {
 
       // Set up event listener BEFORE connecting (to catch sessionState events)
       _sub?.cancel();
-      _logger.info('voice.setting_up_event_listener');
       _sub = gateway.events.listen(_onGatewayEvent, onError: (e) {
         lastError = e.toString();
         _logger.error('voice.gateway_event_stream_error', error: e);
         _setState(VoiceUiState.error);
       });
+
+      // Validate Firebase token before connecting
+      if (firebaseIdToken.isEmpty) {
+        lastError = 'Firebase ID token is required but was empty. Please ensure authentication is complete.';
+        _logger.error('voice.firebase_token_empty', data: {
+          'url': gatewayUrl.toString(),
+        });
+        _setState(VoiceUiState.error);
+        await audio.playback.dispose();
+        return;
+      }
 
       // Connect to gateway
       try {
@@ -229,13 +239,17 @@ class VoiceSessionController extends ChangeNotifier {
   /// Enqueue audio chunk for backpressure-controlled sending
   void _enqueueAudioChunk(Uint8List pcm16k) {
     if (!_sessionStarted || !_serverReady || _micMuted) {
-      _logger.debug('voice.audio_chunk_rejected', data: {
-        'reason': !_sessionStarted 
-            ? 'session_not_started' 
-            : !_serverReady 
-                ? 'server_not_ready'
-                : 'mic_muted',
-      });
+      // Only log rejection if it's unexpected (not just mic muted)
+      if (!_micMuted) {
+        _logger.warn('voice.audio_chunk_rejected', data: {
+          'reason': !_sessionStarted 
+              ? 'session_not_started' 
+              : 'server_not_ready',
+          'session_started': _sessionStarted,
+          'server_ready': _serverReady,
+          'mic_capture_active': _micCaptureActive,
+        });
+      }
       return;
     }
 
@@ -248,12 +262,12 @@ class VoiceSessionController extends ChangeNotifier {
     // Store RAW bytes; encode later in drain (saves CPU if chunks are dropped)
     _audioQueue.add(_QueuedAudio(pcm16k));
     
-    // Log audio enqueue (every 20th chunk to avoid spam)
+    // Log audio enqueue only if there are issues (queue backing up or chunks dropped)
     _audioEnqueueCounter++;
-    if (_audioEnqueueCounter % 20 == 0) {
-      _logger.info('voice.audio_chunk_enqueued', data: {
-        'chunk_size_bytes': pcm16k.length,
+    if (_audioEnqueueCounter % 200 == 0 && (_audioQueue.length > _maxQueuedChunks * 0.8 || _droppedAudioChunks > 0)) {
+      _logger.warn('voice.audio_queue_status', data: {
         'queue_depth': _audioQueue.length,
+        'max_allowed': _maxQueuedChunks,
         'total_enqueued': _audioEnqueueCounter,
         'total_dropped': _droppedAudioChunks,
       });
@@ -387,12 +401,10 @@ class VoiceSessionController extends ChangeNotifier {
       // Encode on drain (not on enqueue) to save CPU if chunks are dropped
       final b64 = base64Encode(item.pcm16k);
       
-      // Log audio being sent to gateway (every 25th chunk to avoid spam)
+      // Log audio being sent to gateway (every 100th chunk - reduced frequency)
       _audioSendCounter++;
-      if (_audioSendCounter % 25 == 0) {
-        _logger.info('voice.audio_chunk_sent_to_gateway', data: {
-          'chunk_size_bytes': item.pcm16k.length,
-          'base64_length': b64.length,
+      if (_audioSendCounter % 100 == 0) {
+        _logger.debug('voice.audio_chunk_sent_to_gateway', data: {
           'total_sent': _audioSendCounter,
           'queue_depth': _audioQueue.length,
         });
@@ -485,13 +497,7 @@ class VoiceSessionController extends ChangeNotifier {
   }
 
   void _onGatewayEvent(GatewayEvent ev) async {
-    // Log all gateway events received
-    _logger.info('voice.gateway_event_received', data: {
-      'event_type': ev.type.toString(),
-      'sequence': ev.seq,
-      'has_payload': ev.payload.isNotEmpty,
-    });
-    
+    // Only log errors and state changes, not every event
     // Sequence gap detection and ordering guard
     if (ev.seq != 0) {
       // Drop out-of-order events
@@ -520,6 +526,10 @@ class VoiceSessionController extends ChangeNotifier {
       case GatewayEventType.sessionState: {
         final state = ev.payload['state'] as String? ?? '';
         if (state == 'listening') {
+          _logger.info('voice.server_listening_state_received', data: {
+            'current_session_started': _sessionStarted,
+            'current_server_ready': _serverReady,
+          });
           _setState(VoiceUiState.listening);
           _serverReady = true;
           // Start mic capture now that server is ready
@@ -537,10 +547,7 @@ class VoiceSessionController extends ChangeNotifier {
       case GatewayEventType.userTranscriptPartial: {
         final text = ev.payload['text'] as String? ?? '';
         userTranscriptPartial = text;
-        _logger.info('voice.user_transcript_partial_received', data: {
-          'text_length': text.length,
-          'sequence': ev.seq,
-        });
+        // Only log final transcripts, not every partial update
         notifyListeners();
         break;
       }
@@ -564,11 +571,7 @@ class VoiceSessionController extends ChangeNotifier {
         // This is assistant caption (modelTurn.text), not user ASR
         final text = ev.payload['text'] as String? ?? '';
         assistantCaptionPartial = text;
-        _logger.info('voice.assistant_caption_partial_received', data: {
-          'text': text,
-          'text_length': text.length,
-          'sequence': ev.seq,
-        });
+        // Only log final transcripts, not every partial update
         notifyListeners();
         break;
       }
@@ -616,11 +619,7 @@ class VoiceSessionController extends ChangeNotifier {
         final data = ev.payload['data'] as String?;
         if (data != null && data.isNotEmpty) {
           final bytes = base64Decode(data);
-          _logger.info('voice.audio_response_received', data: {
-            'audio_data_length': data.length,
-            'decoded_bytes': bytes.length,
-            'sequence': ev.seq,
-          });
+          // Only log empty audio responses (errors), not every chunk
           // Enqueue for jitter buffer (don't feed directly)
           _enqueuePlayback(Uint8List.fromList(bytes));
         } else {
@@ -645,13 +644,29 @@ class VoiceSessionController extends ChangeNotifier {
       }
 
       case GatewayEventType.error: {
-        lastError = ev.payload['message'] as String? ?? 'Unknown gateway error';
+        final errorMessage = ev.payload['message'] as String? ?? 'Unknown gateway error';
+        final errorCode = ev.payload['code'] as String?;
+        lastError = errorMessage;
+        
+        _logger.error('voice.gateway_error_received', data: {
+          'message': errorMessage,
+          'code': errorCode,
+          'sequence': ev.seq,
+          'payload_keys': ev.payload.keys.toList(),
+          'session_started': _sessionStarted,
+          'server_ready': _serverReady,
+          'mic_capture_active': _micCaptureActive,
+        });
+        
         // Clear audio queue on error to prevent stale sends
         _audioQueue.clear();
         // Stop mic capture on error to prevent spam and resource waste
         _micCaptureActive = false;
         _serverReady = false;
         _micMuted = false;
+        // Note: We do NOT set _sessionStarted = false here because the session
+        // might still be partially active (WebSocket might reconnect, etc.)
+        // Only stop() or dispose() should fully reset _sessionStarted.
         unawaited(_stopMicCapture());
         _setState(VoiceUiState.error);
         break;
@@ -728,20 +743,18 @@ class VoiceSessionController extends ChangeNotifier {
 
   /// Start mic capture if server is ready and not already capturing
   Future<void> _startMicCaptureIfNeeded() async {
-    if (_micCaptureActive || !_sessionStarted || !_serverReady) return;
+    if (_micCaptureActive || !_sessionStarted || !_serverReady) {
+      return;
+    }
     
     try {
       _micCaptureActive = true;
-      _logger.info('voice.starting_audio_capture', data: {
-        'use_mock': audio is NoOpAudioEngine,
-      });
+      _logger.info('voice.starting_audio_capture');
       await audio.capture.start(onPcm16k: (pcm16k) {
         // Enqueue audio chunk (will be drained at fixed 20ms cadence)
         _enqueueAudioChunk(pcm16k);
       });
-      _logger.info('voice.audio_capture_started', data: {
-        'is_capturing': audio.capture.isCapturing,
-      });
+      _logger.info('voice.audio_capture_started');
     } catch (e) {
       _micCaptureActive = false;
       lastError = 'Failed to start audio capture: $e';

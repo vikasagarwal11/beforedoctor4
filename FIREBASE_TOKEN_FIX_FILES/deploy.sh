@@ -55,7 +55,7 @@ gcloud run deploy $SERVICE_NAME \
   --region $REGION \
   --allow-unauthenticated \
   --service-account=$SERVICE_ACCOUNT \
-  --set-env-vars="VERTEX_AI_PROJECT_ID=$PROJECT_ID,VERTEX_AI_LOCATION=$REGION,FIREBASE_PROJECT_ID=beforedoctor4,NODE_ENV=production" \
+  --set-env-vars="VERTEX_AI_PROJECT_ID=$PROJECT_ID,VERTEX_AI_LOCATION=$REGION,NODE_ENV=production" \
   --memory=512Mi \
   --cpu=1 \
   --timeout=3600 \

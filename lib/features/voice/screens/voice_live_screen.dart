@@ -63,13 +63,30 @@ class VoiceLiveScreen extends HookConsumerWidget {
       [gateway, audio],
     );
 
-    // Prevent duplicate session starts due to rebuilds
-    final startedRef = useRef(false);
+    // Track if we've successfully started a session (not just attempted)
+    final sessionStartedRef = useRef(false);
+    // Track if effect is currently running to prevent disposal during active session
+    final isRunningRef = useRef(false);
 
     useEffect(() {
-      // Ensure session starts only once per screen mount
-      if (startedRef.value) return null;
-      startedRef.value = true;
+      // Wait for Firebase token to be available before starting session
+      if (firebaseIdToken.isEmpty) {
+        _logger.info('voice.waiting_for_firebase_token', data: {
+          'token_length': firebaseIdToken.length,
+        });
+        return null; // Will retry when token becomes available
+      }
+
+      // If we've already started a session, don't start again
+      if (sessionStartedRef.value || isRunningRef.value) {
+        _logger.debug('voice.session_already_running', data: {
+          'session_started': sessionStartedRef.value,
+          'is_running': isRunningRef.value,
+        });
+        return null;
+      }
+
+      isRunningRef.value = true;
 
       Future.microtask(() async {
         // Permission warm-up: request mic permission at UI level before starting session
@@ -132,11 +149,35 @@ class VoiceLiveScreen extends HookConsumerWidget {
           firebaseIdToken: firebaseIdToken,
           sessionConfig: sessionConfig,
         );
+        
+        // Mark session as started only after successful start
+        sessionStartedRef.value = true;
+        isRunningRef.value = false;
+      }).catchError((error) {
+        // Reset flag on error so we can retry if token is refreshed
+        sessionStartedRef.value = false;
+        isRunningRef.value = false;
+        _logger.error('voice.session_start_failed', error: error);
       });
+      
+      // Cleanup: Only dispose if session hasn't successfully started
+      // This prevents premature disposal during active connections when dependencies change
       return () {
-        unawaited(controller.dispose());
+        // If session hasn't started yet, safe to dispose
+        // If session started, keep it alive (will be disposed on actual widget unmount)
+        if (!sessionStartedRef.value && !isRunningRef.value) {
+          _logger.debug('voice.disposing_controller_before_session_start');
+          unawaited(controller.dispose());
+        } else {
+          _logger.debug('voice.skipping_dispose_session_active', data: {
+            'session_started': sessionStartedRef.value,
+            'is_running': isRunningRef.value,
+          });
+        }
+        // Reset running flag on cleanup
+        isRunningRef.value = false;
       };
-    }, [controller]); // Keep deps tight to prevent re-runs
+    }, [controller, firebaseIdToken, gatewayUrl, sessionConfig]); // Include all deps but handle disposal carefully
 
     useListenable(controller);
     useListenable(aura);

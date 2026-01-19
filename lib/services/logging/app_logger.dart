@@ -87,8 +87,12 @@ class AppLogger {
     for (final entry in data.entries) {
       final value = entry.value;
       if (value == null) continue;
-      if (value is num || value is bool || value is String) {
+      // Firebase Analytics only accepts String or num (not bool)
+      if (value is num || value is String) {
         sanitized[entry.key] = value;
+      } else if (value is bool) {
+        // Convert bool to String for Firebase Analytics compatibility
+        sanitized[entry.key] = value.toString();
       } else {
         sanitized[entry.key] = value.toString();
       }

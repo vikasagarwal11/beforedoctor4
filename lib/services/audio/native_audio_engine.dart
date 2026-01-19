@@ -457,8 +457,9 @@ class _NativePlayback implements IAudioPlayback {
     try {
       await FlutterPcmSound.stop();
       _prepared = false;
-      // Re-prepare for next audio
-      await prepare();
+      // Note: Do NOT re-prepare here. The prepare() call should be done explicitly
+      // before the next feed() call. Re-preparing here can cause AVAudioSession errors
+      // when called during session teardown or error handling.
       _logger.debug('audio.playback_flushed');
     } catch (e) {
       _logger.warn('audio.playback_stop_failed', data: {'error': e.toString()});

@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'firebase_options.dart';
 
 import 'app/app_shell.dart';
 import 'core/theme/app_theme.dart';
@@ -10,18 +9,15 @@ import 'data/repositories/mock_repo.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
-  // Initialize Firebase with explicit options (FlutterFire CLI approach)
-  // This enables multi-platform support and fixes Android configuration
+  // Initialize Firebase only if GoogleService-Info.plist exists
+  // For now, we use mock tokens so Firebase is optional
   try {
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-    print('✅ Firebase initialized successfully');
+    await Firebase.initializeApp();
   } catch (e) {
-    // Firebase not configured - this should not happen in production
-    print('❌ Firebase initialization failed: $e');
-    print('   Please ensure firebase_options.dart is generated correctly');
-    print('   App authentication will fail without Firebase');
+    // Firebase not configured (missing GoogleService-Info.plist)
+    // App will continue with mock tokens
+    print('⚠️ Firebase initialization skipped: $e');
+    print('   App will continue with mock token authentication');
   }
   
   runApp(ProviderScope(child: MyApp(repo: MockRepo.bootstrap())));
@@ -35,7 +31,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PV Reporting',
+      title: 'PRO + PV Wireframe',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light(),
       darkTheme: AppTheme.dark(),

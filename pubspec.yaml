@@ -1,4 +1,4 @@
-name: pro_pv_wireframe
+name: pv_reporting
 description: Production-grade UI wireframe (no business logic) for Episode-based PRO + PV app.
 publish_to: "none"
 version: 0.1.0+1

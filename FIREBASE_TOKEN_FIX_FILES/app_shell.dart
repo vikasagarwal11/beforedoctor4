@@ -44,81 +44,29 @@ class _AppShellState extends State<AppShell> {
   void _setProfile(PersonProfile p) => setState(() => _activeProfile = p);
 
   void _listenForAuthToken() {
-    // Production-grade: Use Firebase Auth with anonymous sign-in
-    // If Firebase is not initialized, app will fail gracefully (no mock tokens in production)
+    // Only use Firebase Auth if Firebase is initialized
+    // Otherwise, use mock token directly (for testing without Firebase setup)
     if (Firebase.apps.isEmpty) {
-      // Firebase not configured - this should not happen in production
-      print('❌ Firebase not initialized - authentication required');
-      print('   Please ensure GoogleService-Info.plist is in ios/Runner/');
-      _firebaseIdToken = ''; // Empty token - gateway will reject (as expected in production)
+      // Firebase not initialized - use mock token directly
+      _firebaseIdToken = 'mock_token_for_testing';
       return;
     }
     
-    // Sign in anonymously if no user is signed in (production-grade approach)
-    final auth = FirebaseAuth.instance;
-    if (auth.currentUser == null) {
-      // Sign in anonymously - this creates a Firebase user immediately
-      auth.signInAnonymously().then((credential) {
-        print('✅ Firebase anonymous sign-in successful');
-        print('   User ID: ${credential.user?.uid}');
-        // Token will be fetched via the listener below
-      }).catchError((error) {
-        print('❌ Firebase anonymous sign-in failed: $error');
-        print('   Make sure Anonymous Auth is enabled in Firebase Console');
-        if (mounted) {
-          setState(() {
-            _firebaseIdToken = ''; // Empty token - will cause gateway to reject
-          });
-        }
-      });
-    }
-    
-    // Listen for auth token changes (gets token when user signs in)
+    // Firebase is initialized - listen for auth token changes
     _authSub = FirebaseAuth.instance.idTokenChanges().listen((user) async {
-      if (user == null) {
-        // No user signed in - this should not happen after anonymous sign-in
-        print('⚠️ No Firebase user - attempting anonymous sign-in...');
-        try {
-          await auth.signInAnonymously();
-          // Token will be fetched in the next listener event
-        } catch (e) {
-          print('❌ Failed to sign in anonymously: $e');
-        }
-        return;
-      }
-      
-      // User is signed in - get fresh token
-      try {
-        final token = await user.getIdToken(true); // Force refresh
-        if (!mounted) return;
-        if (token != null) {
-          setState(() {
-            _firebaseIdToken = token;
-            print('✅ Firebase ID token obtained (length: ${token.length})');
-          });
-        } else {
-          print('⚠️ Firebase ID token is null');
-          if (mounted) {
-            setState(() {
-              _firebaseIdToken = ''; // Empty token - gateway will reject
-            });
-          }
-        }
-      } catch (error) {
-        print('❌ Failed to get Firebase ID token: $error');
-        if (mounted) {
-          setState(() {
-            _firebaseIdToken = ''; // Empty token - gateway will reject
-          });
-        }
-      }
-    }, onError: (error) {
-      print('❌ Firebase auth listener error: $error');
-      if (mounted) {
-        setState(() {
-          _firebaseIdToken = ''; // Empty token - gateway will reject
-        });
-      }
+      final token = await user?.getIdToken();
+      if (!mounted) return;
+      setState(() {
+        // Fallback to mock token if no user signed in (for testing)
+        // In production, ensure a user is signed in or use anonymous auth
+        _firebaseIdToken = token ?? 'mock_token_for_testing';
+      });
+    }, onError: (_) {
+      if (!mounted) return;
+      setState(() {
+        // Use mock token on error to allow testing without full Firebase setup
+        _firebaseIdToken = 'mock_token_for_testing';
+      });
     });
   }
 
@@ -139,7 +87,7 @@ class _AppShellState extends State<AppShell> {
         // Determine gateway URL based on platform
         // PRODUCTION: Use Cloud Run URL (no local network permission needed)
         // DEVELOPMENT: Uncomment the platform-specific URLs below and comment out production URL
-        final gatewayUrl = 'wss://beforedoctor-gateway-531178459822.us-central1.run.app'; // Production Cloud Run URL
+        final gatewayUrl = 'wss://beforedoctor-gateway-u3gdra7oka-uc.a.run.app'; // Production Cloud Run URL
         
         // Development URLs (for local testing - uncomment to use):
         // final gatewayUrl = Platform.isAndroid
