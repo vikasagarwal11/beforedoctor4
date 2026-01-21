@@ -664,6 +664,7 @@ export class VertexLiveWSSession {
         error_message: error.message,
       });
       this.emit('error', error);
+      throw error; // CRITICAL: fail fast so gateway can recover
     }
   }
 
@@ -784,6 +785,7 @@ export class VertexLiveWSSession {
         error_message: error.message,
       });
       this.emit('error', error);
+      throw error; // CRITICAL: fail fast so gateway can recover
     }
   }
 
