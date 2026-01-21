@@ -82,23 +82,25 @@ import { logger } from './logger.js';
     };
 
     // Helper to send events in gateway protocol format
+    // Note: eventHandler will be properly initialized in client.hello handler
     const sendEvent = (type, payload) => {
+      // Temporary handler for pre-session events (before eventHandler is initialized)
       if (!eventHandler) {
-        eventHandler = new GatewayEventHandler((t, p) => {
-          const seq = eventHandler.nextSeq();
-          const message = JSON.stringify({
-            type: t,
-            seq: seq,
-            payload: p,
-          });
-          if (ws.readyState === ws.OPEN) {
-            ws.send(message);
-            // Log event sent (no payload content - may contain PHI)
-            logger.gateway('event_sent', { type: t, seq });
-          }
+        let tempSeq = 0;
+        const message = JSON.stringify({
+          type: type,
+          seq: tempSeq++,
+          payload: payload,
         });
+        
+        if (ws.readyState === ws.OPEN) {
+          ws.send(message);
+          logger.gateway('event_sent_pre_session', { type, seq: tempSeq - 1 });
+        }
+        return;
       }
       
+      // Normal path: use eventHandler for sequence management
       const seq = eventHandler.nextSeq();
       const message = JSON.stringify({
         type: type,
@@ -108,7 +110,6 @@ import { logger } from './logger.js';
       
       if (ws.readyState === ws.OPEN) {
         ws.send(message);
-        // Log event sent (no payload content)
         logger.gateway('event_sent', { type, seq });
       }
     };
@@ -235,11 +236,11 @@ import { logger } from './logger.js';
                 });
               });
 
+              // Send initial connecting state (before startSession for UX responsiveness)
+              sendStateEvent('connecting');
+
               // Start session (waits for setupComplete internally)
               await vertexSession.startSession();
-
-              // Send initial connecting state
-              sendStateEvent('connecting');
 
               // Safety net: if setup already completed before handler fired
               if (vertexSession.isSetup === true && vertexReady !== true) {
@@ -424,10 +425,14 @@ import { logger } from './logger.js';
           case 'client.audio.chunk':
           case 'client.audio.chunk.base64': {
             // Backward compatibility: accept both client.audio.chunk and client.audio.chunk.base64
-            if (!vertexSession || !authenticated) {
+            if (!vertexSession || !authenticated || !vertexReady) {
               logger.warn('gateway.audio_chunk_rejected', {
                 session_id: sessionId,
-                reason: !vertexSession ? 'session_not_initialized' : 'not_authenticated',
+                reason: !vertexSession
+                  ? 'session_not_initialized'
+                  : !authenticated
+                    ? 'not_authenticated'
+                    : 'vertex_not_ready',
               });
               sendEvent('server.error', {
                 message: 'Session not initialized',
