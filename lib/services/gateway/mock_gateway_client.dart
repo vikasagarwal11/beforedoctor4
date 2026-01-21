@@ -8,7 +8,7 @@
 // - audioStop (barge-in) and emergency example
 
 import 'dart:async';
-import 'dart:convert';
+import 'dart:typed_data';
 
 import '../../services/logging/app_logger.dart';
 import 'gateway_client.dart';
@@ -98,11 +98,32 @@ class MockGatewayClient implements IGatewayClient {
   }
 
   @override
+  Future<void> sendAudioChunkBinary(Uint8List pcm16k) async {
+    if (!_connected) return;
+    _mockAudioCounter++;
+    if (_mockAudioCounter % 50 == 0) {
+      _logger.info('mock_gateway.binary_audio_received', data: {
+        'pcm_bytes': pcm16k.length,
+        'total_chunks': _mockAudioCounter,
+      });
+    }
+    _emit(GatewayEventType.userTranscriptPartial, {'text': '[mock] receiving binary audio (${pcm16k.length} bytes)'});
+  }
+
+  @override
   Future<void> sendTurnComplete() async {
     if (!_connected) return;
     _logger.info('mock_gateway.turn_complete_received');
     // In mock mode, turnComplete triggers a final transcript
     _emit(GatewayEventType.userTranscriptFinal, {'text': '[mock] User finished speaking'});
+  }
+
+  @override
+  Future<void> sendBargeIn() async {
+    if (!_connected) return;
+    _logger.info('mock_gateway.barge_in_received');
+    // In mock mode, barge-in immediately stops AI audio
+    _emit(GatewayEventType.audioStop, {});
   }
 
   @override

@@ -114,6 +114,17 @@ String clientTurnComplete() {
   return jsonEncode({'type': 'client.audio.turnComplete', 'payload': {}});
 }
 
+/// Signal barge-in: user speaking while AI is responding (interrupt + cancel server audio)
+String clientBargeIn() {
+  return jsonEncode({
+    'type': 'client.audio.bargeIn',
+    'payload': {
+      'reason': 'user_speaking',
+      'timestamp': DateTime.now().toIso8601String(),
+    },
+  });
+}
+
 /// Optional: client ack when it flushed playback (useful for debugging).
 String clientAudioFlushed() {
   return jsonEncode({'type': 'client.audio.flushed', 'payload': {}});

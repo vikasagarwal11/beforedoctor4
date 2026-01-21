@@ -71,7 +71,10 @@ class _NativeCapture implements IAudioCapture {
 
   @override
   Future<void> start({required void Function(Uint8List pcm16k) onPcm16k}) async {
-    if (_isCapturing) return;
+    if (_isCapturing) {
+      _logger.warn('audio.capture_already_active');
+      return;
+    }
     
     try {
       // Configure iOS audio session before starting
@@ -81,8 +84,13 @@ class _NativeCapture implements IAudioCapture {
       _audioBuffer.clear();
       _onPcm16kCallback = onPcm16k; // Store callback for final flush
 
-      _recorder = FlutterSoundRecorder();
-      await _recorder!.openRecorder();
+      // Reuse existing recorder if available, otherwise create new one
+      _recorder ??= FlutterSoundRecorder();
+      
+      // Only open if not already open
+      if (!(_recorder!.isRecording || _recorder!.isPaused)) {
+        await _recorder!.openRecorder();
+      }
 
       // Create stream controller for audio data
       _streamController = StreamController<Uint8List>.broadcast();
@@ -275,7 +283,10 @@ class _NativeCapture implements IAudioCapture {
 
   @override
   Future<void> stop() async {
-    if (!_isCapturing) return;
+    if (!_isCapturing) {
+      _logger.debug('audio.capture_already_stopped');
+      return;
+    }
     
     _isCapturing = false;
     
@@ -306,22 +317,41 @@ class _NativeCapture implements IAudioCapture {
     _firstChunkTime = null;
     _totalBytesReceived = 0;
     _resampler = null;
+    _chunkCounter = 0;
     
     try {
       await _sub?.cancel();
-      await _recorder?.stopRecorder();
-      await _recorder?.closeRecorder();
+      _sub = null;
+      
+      if (_recorder != null) {
+        if (_recorder!.isRecording) {
+          await _recorder!.stopRecorder();
+        }
+        await _recorder!.closeRecorder();
+        // Keep recorder instance for reuse (don't null it out)
+        // This prevents creating multiple instances
+      }
+      
       await _streamController?.close();
+      _streamController = null;
     } catch (e) {
       _logger.warn('audio.capture_stop_error', data: {'error': e.toString()});
+      // Reset recorder on error to allow recovery
+      _recorder = null;
     }
     
-    _sub = null;
-    _recorder = null;
-    _streamController = null;
-    _onPcm16kCallback = null;
-    
     _logger.info('audio.capture_stopped');
+  }
+  
+  /// Dispose of the recorder completely (for cleanup)
+  Future<void> dispose() async {
+    await stop();
+    try {
+      await _recorder?.closeRecorder();
+    } catch (e) {
+      _logger.debug('audio.capture_dispose_error', data: {'error': e.toString()});
+    }
+    _recorder = null;
   }
 }
 
@@ -414,6 +444,19 @@ class _NativePlayback implements IAudioPlayback {
     if (_prepared) return;
     
     try {
+      // First, ensure any previous session is fully stopped
+      try {
+        await FlutterPcmSound.stop();
+        _logger.debug('audio.playback_pre_cleanup');
+      } catch (e) {
+        // Ignore errors from stopping non-existent session
+        _logger.debug('audio.playback_pre_cleanup_ignored', data: {'error': e.toString()});
+      }
+      
+      // Small delay to let iOS audio session settle
+      await Future.delayed(const Duration(milliseconds: 100));
+      
+      // Now set up the audio session
       await FlutterPcmSound.setup(
         sampleRate: _targetSampleRate,
         channelCount: _targetChannels,
@@ -426,6 +469,7 @@ class _NativePlayback implements IAudioPlayback {
       });
     } catch (e) {
       _logger.error('audio.playback_prepare_failed', error: e);
+      _prepared = false;
       rethrow;
     }
   }
@@ -454,6 +498,8 @@ class _NativePlayback implements IAudioPlayback {
   @override
   Future<void> stopNow() async {
     // Critical for barge-in: this flushes internal buffers immediately.
+    if (!_prepared) return; // Already stopped
+    
     try {
       await FlutterPcmSound.stop();
       _prepared = false;

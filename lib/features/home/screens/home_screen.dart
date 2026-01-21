@@ -446,7 +446,7 @@ class _EpisodeRow extends StatelessWidget {
             child: Row(
               children: [
                 CircleAvatar(
-                  backgroundColor: statusColor.withOpacity(0.12),
+                  backgroundColor: statusColor.withValues(alpha: 0.12),
                   child: Icon(
                     episode.productType == 'Vaccine' ? Icons.vaccines_outlined : Icons.medication_outlined,
                     color: statusColor,
@@ -506,7 +506,7 @@ class _TimelineEventRow extends StatelessWidget {
             child: Row(
               children: [
                 CircleAvatar(
-                  backgroundColor: color.withOpacity(0.12),
+                  backgroundColor: color.withValues(alpha: 0.12),
                   child: Icon(icon, color: color, size: 20),
                 ),
                 const SizedBox(width: AppTokens.md),

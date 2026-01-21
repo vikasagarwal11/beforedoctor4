@@ -28,6 +28,7 @@ export class VertexLiveWSSession {
     this.lastError = null;
     this.audioSendCounter = 0;
     this.audioReceiveCounter = 0;
+    this.stopAudioForwarding = false; // Pause audio forwarding on barge-in
     this._hasLoggedRawMessage = false;
     this.eventHandlers = {
       transcript: [],
@@ -444,14 +445,30 @@ export class VertexLiveWSSession {
           message.bidiGenerateContentSetupComplete) {
         logger.info('vertex.setup_complete', {});
         this.isSetup = true;
+        // Emit setup event so gateway knows Vertex is ready
+        this.emit('setup');
         return;
       }
 
       // Handle server content (model responses)
       if (message.serverContent) {
+        // Log serverContent structure for debugging
+        logger.vertexAI('server_content_received', {
+          has_modelTurn: !!message.serverContent.modelTurn,
+          has_inputTranscription: !!(message.serverContent.inputTranscription || 
+                                      message.serverContent.userTranscript || 
+                                      message.serverContent.userTranscription),
+          has_outputTranscription: !!(message.serverContent.outputAudioTranscription ||
+                                       message.serverContent.outputTranscription ||
+                                       message.serverContent.modelTranscription),
+          has_interrupted: message.serverContent.interrupted === true,
+          serverContent_keys: Object.keys(message.serverContent).join(','),
+        });
+
         // Check for interruption (barge-in)
         if (message.serverContent.interrupted === true) {
           logger.vertexAI('barge_in_detected', {});
+          this.stopAudioForwarding = true; // Stop forwarding immediately
           this.emit('bargeIn');
         }
 
@@ -489,7 +506,15 @@ export class VertexLiveWSSession {
                   total_received: this.audioReceiveCounter,
                 });
               }
-              this.emit('audio', audioData);
+              
+              // Skip forwarding audio if barge-in occurred (client already flushed)
+              if (!this.stopAudioForwarding) {
+                this.emit('audio', audioData);
+              } else {
+                logger.vertexAI('audio_dropped_barge_in', {
+                  audio_size_bytes: audioData.length,
+                });
+              }
             }
 
             // Handle text (transcript)
@@ -528,6 +553,29 @@ export class VertexLiveWSSession {
               }
             }
           }
+        }
+
+        // Handle output audio transcription (assistant speech captions)
+        // This is the transcription of what the AI is saying (like CC for the AI's voice)
+        const outputTranscript =
+          message.serverContent.outputAudioTranscription ||
+          message.serverContent.outputTranscription ||
+          message.serverContent.modelTranscription ||
+          message.serverContent.assistantTranscription;
+        
+        if (outputTranscript && outputTranscript.text) {
+          const isFinal = outputTranscript.isFinal ?? outputTranscript.final ?? outputTranscript.is_final;
+          const isPartial = isFinal === undefined ? true : !isFinal;
+          logger.vertexAI('output_audio_transcript_received', {
+            has_transcript: true,
+            is_partial: isPartial,
+            text_length: outputTranscript.text.length,
+          });
+          // Emit as transcript (same event as modelTurn.parts[].text for consistency)
+          this.emit('transcript', {
+            text: outputTranscript.text,
+            isPartial: isPartial,
+          });
         }
       }
 
@@ -668,27 +716,68 @@ export class VertexLiveWSSession {
   }
 
   /**
-   * Signal end of user utterance (turnComplete: true)
-   * This tells the model that the user has finished speaking and it should process and respond
+   * Cancel current model output (for barge-in scenarios)
+   * Best-effort: stop forwarding locally and send a turn boundary.
+   * IMPORTANT: do NOT re-enable forwarding as part of cancel.
    */
-  async sendTurnComplete() {
+  async cancelOutput() {
+    if (!this.ws || !this.isConnected || !this.isSetup) {
+      throw new Error('Session not ready - WebSocket not connected or setup not complete');
+    }
+
+    // Stop forwarding immediately (prevents stale audio leaking to client)
+    this.stopAudioForwarding = true;
+
+    try {
+      logger.vertexAI('cancel_output_requested', {
+        is_connected: this.isConnected,
+        is_setup: this.isSetup,
+      });
+
+      // Do NOT re-enable forwarding during cancel
+      await this.sendTurnComplete({ reenableForwarding: false });
+
+      logger.vertexAI('cancel_output_completed', {
+        method: 'turnComplete_reset',
+        forwarding_disabled: true,
+      });
+    } catch (error) {
+      // Keep stopAudioForwarding=true to prevent audio leakage even if Vertex call fails
+      logger.error('vertex.cancel_output_failed', { error_message: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * Signal end of user utterance (turnComplete: true)
+   * @param {Object} options
+   * @param {boolean} options.reenableForwarding - default true; set false for barge-in cancel
+   */
+  async sendTurnComplete({ reenableForwarding = true } = {}) {
     if (!this.ws || !this.isConnected || !this.isSetup) {
       throw new Error('Session not ready - WebSocket not connected or setup not complete');
     }
 
     try {
-      // Send turnComplete message (empty turn with turnComplete: true)
-      const turnCompleteMessage = {
+      // Minimal empty user turn is more compatible than turns:[]
+      const msg = {
         clientContent: {
-          turns: [],
+          turns: [{ role: 'user', parts: [] }],
           turnComplete: true,
         },
       };
 
-      this.ws.send(JSON.stringify(turnCompleteMessage));
-      
-      logger.vertexAI('turn_complete_sent', {});
+      this.ws.send(JSON.stringify(msg));
 
+      if (reenableForwarding) {
+        this.stopAudioForwarding = false;
+      }
+
+      logger.vertexAI('turn_complete_sent_to_vertex', {
+        message_sent: true,
+        has_minimal_turn: true,
+        reenabled_forwarding: reenableForwarding,
+      });
     } catch (error) {
       logger.error('vertex.turn_complete_send_failed', {
         error_code: error.code,

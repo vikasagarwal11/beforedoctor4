@@ -60,9 +60,18 @@ import { logger } from './logger.js';
     let userId = null;
     let sessionConfig = null;
     let authenticated = false;
+    let vertexReady = false; // CRITICAL: Only accept audio after Vertex setup complete
     let stt = null;
     let sttFallbackEnabled = config.stt.enabled;
     let sttUsingFallback = config.stt.enabled;
+    
+    // Track first model audio chunk per turn (used for latency KPI)
+    let firstAudioInTurn = true;
+    
+    // Heartbeat for connection health monitoring
+    let heartbeatInterval = null;
+    let isAlive = true;
+    const HEARTBEAT_INTERVAL_MS = 30000; // 30 seconds
     
     // Metrics tracking
     const metrics = {
@@ -104,13 +113,81 @@ import { logger } from './logger.js';
       }
     };
 
-    // Handle incoming messages
-    ws.on('message', async (data) => {
+    // Track last sent state to avoid spam
+    let lastSentState = null;
+    
+    // Enhanced sendEvent that suppresses duplicate state transitions
+    const sendStateEvent = (state) => {
+      if (state !== lastSentState) {
+        lastSentState = state;
+        sendEvent('server.session.state', { state });
+      }
+    };
+
+    // Handle incoming messages (both JSON and binary)
+    ws.on('message', async (data, isBinary) => {
       try {
-        const message = JSON.parse(data.toString());
+        // =========================================================
+        // 1) BINARY FRAMES: raw PCM16k s16le mono audio frames
+        // =========================================================
+        if (isBinary) {
+          // CRITICAL: Reject audio until Vertex setup is complete
+          if (!vertexSession || !authenticated || !vertexReady) {
+            logger.warn('gateway.binary_audio_rejected', {
+              session_id: sessionId,
+              reason: !vertexSession ? 'session_not_initialized' 
+                    : !authenticated ? 'not_authenticated'
+                    : 'vertex_not_ready',
+            });
+            return;
+          }
+
+          const pcmBuffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+          if (pcmBuffer.length < 2) return;
+
+          // Forward to Vertex
+          await vertexSession.sendAudio(pcmBuffer);
+
+          // Optional: feed fallback STT from the same PCM buffer
+          if (sttFallbackEnabled && sttUsingFallback && stt) {
+            try {
+              stt.write(pcmBuffer);
+            } catch (e) {
+              logger.warn('stt.fallback_write_failed', { session_id: sessionId, error: String(e) });
+            }
+          }
+
+          sendStateEvent('listening');
+          return;
+        }
+
+        // =========================================================
+        // 2) TEXT FRAMES: JSON protocol messages
+        // =========================================================
+        const text = Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
+        const message = JSON.parse(text);
         
-        // Log message received (no payload content - may contain PHI)
-        logger.gateway('event_received', { type: message.type });
+        logger.gateway('event_received', { session_id: sessionId, type: message?.type });
+        
+        // ---------------------------------------------------------
+        // GATE JSON AUDIO MESSAGES ON vertexReady TOO (IMPORTANT)
+        // ---------------------------------------------------------
+        if (
+          message?.type === 'client.audio.chunk' ||
+          message?.type === 'client.audio.chunk.base64'
+        ) {
+          if (!vertexSession || !authenticated || !vertexReady) {
+            logger.warn('gateway.audio_chunk_rejected', {
+              session_id: sessionId,
+              reason: !vertexSession
+                ? 'session_not_initialized'
+                : !authenticated
+                  ? 'not_authenticated'
+                  : 'vertex_not_ready',
+            });
+            return;
+          }
+        }
 
         switch (message.type) {
           case 'client.hello': {
@@ -138,7 +215,41 @@ import { logger } from './logger.js';
               // Initialize Vertex Live WebSocket session
               vertexSession = new VertexLiveWSSession(sessionConfig);
               await vertexSession.initialize();
+
+              // CRITICAL: Register setup handler BEFORE startSession()
+              // Otherwise the setup event fires before this handler is registered
+              vertexSession.on('setup', () => {
+                // CRITICAL: Set flag to allow audio processing
+                vertexReady = true;
+                
+                logger.session('vertex_setup_complete', sessionId, userId, {
+                  vertex_ready: true,
+                });
+                
+                // NOW it's safe to tell Flutter we're ready and listening
+                sendStateEvent('ready');
+                sendStateEvent('listening');
+                
+                logger.session('session_ready', sessionId, userId, {
+                  audio_accepted: true,
+                });
+              });
+
+              // Start session (waits for setupComplete internally)
               await vertexSession.startSession();
+
+              // Send initial connecting state
+              sendStateEvent('connecting');
+
+              // Safety net: if setup already completed before handler fired
+              if (vertexSession.isSetup === true && vertexReady !== true) {
+                vertexReady = true;
+                sendStateEvent('ready');
+                sendStateEvent('listening');
+                logger.session('session_ready_safety_net', sessionId, userId, {
+                  audio_accepted: true,
+                });
+              }
 
               // Set up event handlers
               eventHandler = new GatewayEventHandler(sendEvent);
@@ -252,7 +363,19 @@ import { logger } from './logger.js';
                 }
               }
 
+              // Track if this is first audio in the turn (already declared at connection scope)
+              firstAudioInTurn = true;
+              
               vertexSession.on('audio', (audioBuffer) => {
+                // LATENCY KPI: Emit on first audio chunk
+                if (firstAudioInTurn) {
+                  sendEvent('server.kpi', {
+                    type: 'first_model_audio',
+                    atMs: Date.now(),
+                  });
+                  firstAudioInTurn = false;
+                }
+                
                 eventHandler.handleAudio(audioBuffer);
               });
 
@@ -278,12 +401,6 @@ import { logger } from './logger.js';
                 });
                 eventHandler.sendError(error.message);
               });
-
-              // Send ready state
-              sendEvent('server.session.state', { state: 'ready' });
-              sendEvent('server.session.state', { state: 'listening' });
-              
-              logger.session('session_ready', sessionId, userId, {});
 
             } catch (error) {
               // Enhanced error logging with stack trace in development
@@ -336,8 +453,8 @@ import { logger } from './logger.js';
                 stt.write(pcmBuffer);
               }
               
-              // Update state to listening if needed
-              sendEvent('server.session.state', { state: 'listening' });
+              // Update state to listening if needed (sendStateEvent will suppress duplicates)
+              sendStateEvent('listening');
             } catch (error) {
               logger.error('gateway.audio_processing_failed', {
                 session_id: sessionId,
@@ -353,17 +470,39 @@ import { logger } from './logger.js';
           }
 
           case 'client.audio.turnComplete': {
-            if (!vertexSession || !authenticated) {
+            if (!vertexSession || !authenticated || !vertexReady) {
               logger.warn('gateway.turn_complete_rejected', {
                 session_id: sessionId,
-                reason: !vertexSession ? 'session_not_initialized' : 'not_authenticated',
+                reason: !vertexSession
+                  ? 'session_not_initialized'
+                  : !authenticated
+                    ? 'not_authenticated'
+                    : 'vertex_not_ready',
               });
               return;
             }
 
             try {
+              // LATENCY KPI: Record when turnComplete received at gateway
+              sendEvent('server.kpi', {
+                type: 'turnComplete_received',
+                atMs: Date.now(),
+              });
+              
+              logger.gateway('turn_complete_received_from_client', {
+                session_id: sessionId,
+                user_id: userId,
+                timestamp: Date.now(),
+              });
               await vertexSession.sendTurnComplete();
-              logger.gateway('turn_complete_received', {});
+              
+              // Reset first audio flag for next turn
+              firstAudioInTurn = true;
+              
+              logger.gateway('turn_complete_forwarded_to_vertex', {
+                session_id: sessionId,
+                user_id: userId,
+              });
             } catch (error) {
               logger.error('gateway.turn_complete_failed', {
                 session_id: sessionId,
@@ -378,10 +517,48 @@ import { logger } from './logger.js';
             break;
           }
 
+          case 'client.audio.bargeIn': {
+            logger.gateway('barge_in_received', {
+              session_id: sessionId,
+              user_id: userId,
+              reason: message.payload?.reason,
+              timestamp: message.payload?.timestamp,
+            });
+
+            if (vertexSession) {
+              try {
+                // Attempt explicit cancel (best-effort)
+                await vertexSession.cancelOutput();
+                logger.gateway('barge_in_vertex_cancel_sent', {
+                  session_id: sessionId,
+                });
+              } catch (error) {
+                logger.warn('barge_in_vertex_cancel_failed', {
+                  session_id: sessionId,
+                  error_message: error.message,
+                });
+                // Fallback: just stop forwarding
+                vertexSession.stopAudioForwarding = true;
+              }
+            }
+
+            // Acknowledge barge-in to client
+            sendEvent('server.audio.bargeInAck', {
+              timestamp: new Date().toISOString(),
+            });
+
+            // Update state back to listening
+            sendStateEvent('listening');
+            break;
+          }
+
           case 'client.session.stop':
           case 'client.stop': {
             // Backward compatibility: accept both client.session.stop and client.stop
             logger.session('stopped_by_client', sessionId, userId, {});
+            
+            // Reset ready flag
+            vertexReady = false;
             
             if (vertexSession) {
               await vertexSession.close();
@@ -435,6 +612,16 @@ import { logger } from './logger.js';
     // Handle connection close
     ws.on('close', async () => {
       logger.session('connection_closed', sessionId, userId, {});
+      
+      // Reset ready flag
+      vertexReady = false;
+      authenticated = false;
+      
+      // Stop heartbeat
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+      }
       
       if (vertexSession) {
         await vertexSession.close();

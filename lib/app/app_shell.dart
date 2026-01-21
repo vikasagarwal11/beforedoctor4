@@ -138,13 +138,13 @@ class _AppShellState extends State<AppShell> {
         
         // Determine gateway URL based on platform
         // PRODUCTION: Use Cloud Run URL (no local network permission needed)
-        // DEVELOPMENT: Uncomment the platform-specific URLs below and comment out production URL
-        final gatewayUrl = 'wss://beforedoctor-gateway-531178459822.us-central1.run.app'; // Production Cloud Run URL
-        
-        // Development URLs (for local testing - uncomment to use):
-        // final gatewayUrl = Platform.isAndroid
-        //     ? 'ws://10.0.2.2:8080'
-        //     : 'ws://192.168.5.10:8080'; // Your Mac's IP for physical device (localhost for simulator)
+  // DEVELOPMENT: Using local gateway for testing transcription issue
+  // final gatewayUrl = 'wss://beforedoctor-gateway-531178459822.us-central1.run.app'; // Production Cloud Run URL
+
+  // Development URLs (for local testing - using this to debug transcription):
+  final gatewayUrl = Platform.isAndroid
+      ? 'ws://10.0.2.2:8080'
+      : 'ws://192.168.5.10:8080'; // Mac's IP - network verified working!
         
         // Allow real gateway even with mock token for development
         // Set to false to force real audio (requires gateway server running)

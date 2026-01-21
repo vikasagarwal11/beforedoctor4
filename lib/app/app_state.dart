@@ -99,6 +99,4 @@ class AppStateBuilder extends StatelessWidget {
     final state = AppStateScope.of(context);
     return builder(context, state);
   }
-
-
 }

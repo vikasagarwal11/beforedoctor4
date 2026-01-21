@@ -8,6 +8,7 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -24,7 +25,9 @@ abstract class IGatewayClient {
   });
 
   Future<void> sendAudioChunkBase64(String base64Pcm16k);
+  Future<void> sendAudioChunkBinary(Uint8List pcm16k); // Binary WebSocket frames
   Future<void> sendTurnComplete();
+  Future<void> sendBargeIn(); // Cancel server-side audio generation
   Future<void> sendStop();
   Future<void> close();
 }
@@ -84,10 +87,24 @@ class GatewayClient implements IGatewayClient {
     _channel!.sink.add(clientAudioChunk(base64Pcm16k: base64Pcm16k));
   }
 
+  /// Send audio as binary frame (performance optimization - no base64 overhead)
+  /// Use this instead of sendAudioChunkBase64 for lower latency
+  Future<void> sendAudioChunkBinary(Uint8List pcm16k) async {
+    if (_channel == null) return;
+    // Send raw PCM bytes as WebSocket binary frame
+    _channel!.sink.add(pcm16k);
+  }
+
   @override
   Future<void> sendTurnComplete() async {
     if (_channel == null) return;
     _channel!.sink.add(clientTurnComplete());
+  }
+
+  @override
+  Future<void> sendBargeIn() async {
+    if (_channel == null) return;
+    _channel!.sink.add(clientBargeIn());
   }
 
   @override

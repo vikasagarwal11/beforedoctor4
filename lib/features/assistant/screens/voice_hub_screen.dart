@@ -248,7 +248,7 @@ class _BigMicButton extends StatelessWidget {
             boxShadow: [
               BoxShadow(
                 blurRadius: 24,
-                color: Colors.black.withOpacity(0.18),
+                color: Colors.black.withValues(alpha: 0.18),
                 offset: const Offset(0, 12),
               ),
             ],
@@ -274,7 +274,7 @@ class _WaveformStub extends StatelessWidget {
       height: 56,
       width: double.infinity,
       decoration: BoxDecoration(
-        color: c.surfaceContainerHighest.withOpacity(0.6),
+        color: c.surfaceContainerHighest.withValues(alpha: 0.6),
         borderRadius: BorderRadius.circular(16),
       ),
       alignment: Alignment.center,

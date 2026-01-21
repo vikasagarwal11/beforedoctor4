@@ -236,7 +236,7 @@ class VoiceLiveScreen extends HookConsumerWidget {
     final label = switch (controller.uiState) {
       VoiceUiState.ready => 'Ready',
       VoiceUiState.connecting => 'Connecting…',
-      VoiceUiState.listening => 'Listening',
+      VoiceUiState.listening => controller.isMicMuted ? 'Muted' : '🎙️ Recording…',
       VoiceUiState.speaking => 'Speaking',
       VoiceUiState.processing => 'Processing…',
       VoiceUiState.emergency => 'Urgent',
@@ -248,6 +248,12 @@ class VoiceLiveScreen extends HookConsumerWidget {
       padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
       child: Row(
         children: [
+          // Show recording indicator when actively recording
+          if (controller.uiState == VoiceUiState.listening && !controller.isMicMuted)
+            Padding(
+              padding: const EdgeInsets.only(left: 8),
+              child: _RecordingIndicator(),
+            ),
           Expanded(
             child: Center(
               child: Text(
@@ -314,6 +320,79 @@ class VoiceLiveScreen extends HookConsumerWidget {
                 ),
               ),
             )
+          else if (controller.uiState == VoiceUiState.listening && !controller.isMicMuted)
+            Expanded(
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.mic, size: 48, color: Colors.white24),
+                    const SizedBox(height: 16),
+                    Text(
+                      'Listening... Start speaking',
+                      style: const TextStyle(color: Colors.white54, fontSize: 16),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Recording automatically started',
+                      style: const TextStyle(color: Colors.white38, fontSize: 13),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else if (controller.uiState == VoiceUiState.listening && controller.isMicMuted)
+            Expanded(
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.mic_off, size: 48, color: Colors.red.withOpacity(0.5)),
+                    const SizedBox(height: 16),
+                    Text(
+                      'Microphone is muted',
+                      style: const TextStyle(color: Colors.white54, fontSize: 16),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Tap the mic button below to unmute',
+                      style: const TextStyle(color: Colors.white38, fontSize: 13),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else if (controller.uiState == VoiceUiState.stopped || controller.uiState == VoiceUiState.error)
+            Expanded(
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      controller.uiState == VoiceUiState.error ? Icons.error_outline : Icons.stop_circle_outlined,
+                      size: 48,
+                      color: Colors.white24,
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      controller.uiState == VoiceUiState.error ? 'Session ended with error' : 'Session ended',
+                      style: const TextStyle(color: Colors.white54, fontSize: 16),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Tap the play button below to start a new session',
+                      style: const TextStyle(color: Colors.white38, fontSize: 13),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            )
           else
             const Spacer(),
 
@@ -324,6 +403,8 @@ class VoiceLiveScreen extends HookConsumerWidget {
   }
 
   Widget _buildDock(BuildContext context, VoiceSessionController controller, ValueNotifier<bool> detailsOpen) {
+    final isStopped = controller.uiState == VoiceUiState.stopped || controller.uiState == VoiceUiState.error;
+    
     return Padding(
       padding: const EdgeInsets.only(bottom: 26, left: 14, right: 14, top: 10),
       child: Row(
@@ -332,34 +413,59 @@ class VoiceLiveScreen extends HookConsumerWidget {
           _DockButton(
             icon: Icons.description_outlined,
             onPressed: () => _toggleDetails(context, detailsOpen, controller),
+            tooltip: 'View details',
           ),
-          _DockButton(
-            icon: controller.isMicMuted ? Icons.mic_off : Icons.mic,
-            onPressed: () async {
-              try {
-                await controller.toggleMic();
-              } catch (e) {
-                _logger.error('voice.mic_toggle_failed', error: e);
-              }
-            },
-          ),
-          _DockButton(
-            icon: Icons.stop_circle_outlined,
-            wide: true,
-            color: Colors.redAccent,
-            onPressed: () async {
-              try {
-                _logger.info('voice.stop_button_pressed');
-                await controller.stop();
-                _logger.info('voice.stop_completed');
-                // VoiceLiveScreen is embedded as a tab in AppShell, not a pushed route
-                // So we just stop the session - user can switch tabs manually
-                // No navigation needed
-              } catch (e) {
-                _logger.error('voice.stop_failed', error: e);
-              }
-            },
-          ),
+          if (!isStopped) ...[
+            _DockButton(
+              icon: controller.isMicMuted ? Icons.mic_off : Icons.mic,
+              color: controller.isMicMuted ? Colors.red : Colors.green,
+              onPressed: () async {
+                try {
+                  await controller.toggleMic();
+                } catch (e) {
+                  _logger.error('voice.mic_toggle_failed', error: e);
+                }
+              },
+              tooltip: controller.isMicMuted ? 'Tap to unmute' : 'Tap to mute',
+            ),
+            _DockButton(
+              icon: Icons.stop_circle_outlined,
+              wide: true,
+              color: Colors.redAccent,
+              onPressed: () async {
+                try {
+                  _logger.info('voice.stop_button_pressed');
+                  await controller.stop();
+                  _logger.info('voice.stop_completed');
+                  // VoiceLiveScreen is embedded as a tab in AppShell, not a pushed route
+                  // So we just stop the session - user can switch tabs manually
+                  // No navigation needed
+                } catch (e) {
+                  _logger.error('voice.stop_failed', error: e);
+                }
+              },
+              tooltip: 'End session',
+            ),
+          ] else
+            _DockButton(
+              icon: Icons.play_circle_outlined,
+              wide: true,
+              color: Colors.green,
+              onPressed: () async {
+                try {
+                  _logger.info('voice.restart_button_pressed');
+                  await controller.start(
+                    gatewayUrl: gatewayUrl,
+                    firebaseIdToken: firebaseIdToken,
+                    sessionConfig: sessionConfig,
+                  );
+                  _logger.info('voice.restart_completed');
+                } catch (e) {
+                  _logger.error('voice.restart_failed', error: e);
+                }
+              },
+              tooltip: 'Start new session',
+            ),
         ],
       ),
     );
@@ -416,17 +522,19 @@ class _DockButton extends StatelessWidget {
   final VoidCallback? onPressed;
   final bool wide;
   final Color color;
+  final String? tooltip;
 
   const _DockButton({
     required this.icon,
     this.onPressed,
     this.wide = false,
     this.color = const Color(0xFF333639),
+    this.tooltip,
   });
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
+    final button = SizedBox(
       width: wide ? 92 : 66,
       height: 52,
       child: ElevatedButton(
@@ -439,6 +547,14 @@ class _DockButton extends StatelessWidget {
         child: Icon(icon, color: Colors.white),
       ),
     );
+
+    if (tooltip != null) {
+      return Tooltip(
+        message: tooltip!,
+        child: button,
+      );
+    }
+    return button;
   }
 }
 
@@ -825,6 +941,61 @@ class _KeyValue extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Pulsing red dot to indicate active recording
+class _RecordingIndicator extends StatefulWidget {
+  const _RecordingIndicator();
+
+  @override
+  State<_RecordingIndicator> createState() => _RecordingIndicatorState();
+}
+
+class _RecordingIndicatorState extends State<_RecordingIndicator> with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _animation;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    )..repeat(reverse: true);
+    _animation = Tween<double>(begin: 0.4, end: 1.0).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _animation,
+      builder: (context, child) {
+        return Container(
+          width: 12,
+          height: 12,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.red.withOpacity(_animation.value),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.red.withOpacity(_animation.value * 0.5),
+                blurRadius: 4,
+                spreadRadius: 1,
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
