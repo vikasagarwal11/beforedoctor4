@@ -81,12 +81,14 @@ import { logger } from './logger.js';
       transcriptSource: 'none', // 'vertex', 'stt', or 'none'
     };
 
+    // Temporary sequence counter for pre-session events
+    let tempSeq = 0;
+    
     // Helper to send events in gateway protocol format
     // Note: eventHandler will be properly initialized in client.hello handler
     const sendEvent = (type, payload) => {
       // Temporary handler for pre-session events (before eventHandler is initialized)
       if (!eventHandler) {
-        let tempSeq = 0;
         const message = JSON.stringify({
           type: type,
           seq: tempSeq++,
