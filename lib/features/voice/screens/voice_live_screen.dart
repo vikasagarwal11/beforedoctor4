@@ -242,6 +242,7 @@ class VoiceLiveScreen extends HookConsumerWidget {
       VoiceUiState.emergency => 'Urgent',
       VoiceUiState.stopped => 'Stopped',
       VoiceUiState.error => 'Error',
+      VoiceUiState.reconnecting => 'Reconnecting…',
     };
 
     return Padding(
