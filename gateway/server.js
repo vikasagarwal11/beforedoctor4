@@ -648,6 +648,42 @@ import { logger } from './logger.js';
         eventHandler.sendError(`Connection error: ${error.message}`);
       }
     });
+
+    // Handle pong responses (heartbeat)
+    ws.on('pong', () => {
+      isAlive = true;
+    });
+
+    // Start heartbeat ping/pong loop
+    heartbeatInterval = setInterval(() => {
+      if (ws.readyState !== ws.OPEN) {
+        return;
+      }
+
+      if (!isAlive) {
+        logger.warn('gateway.heartbeat_failed_closing', { 
+          session_id: sessionId,
+          user_id: userId,
+        });
+        try {
+          ws.terminate();
+        } catch (_) {
+          // Ignore termination errors
+        }
+        return;
+      }
+
+      isAlive = false;
+      try {
+        ws.ping();
+      } catch (e) {
+        logger.warn('gateway.ping_failed', { 
+          session_id: sessionId,
+          user_id: userId,
+          error: String(e),
+        });
+      }
+    }, HEARTBEAT_INTERVAL_MS);
   });
 
   // Graceful shutdown
