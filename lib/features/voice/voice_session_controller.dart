@@ -1121,40 +1121,80 @@ class VoiceSessionController extends ChangeNotifier {
       }
 
       case GatewayEventType.error: {
-        final errorMessage = ev.payload['message'] as String? ?? 'Unknown gateway error';
+        // Parse error from multiple possible formats
+        final errorMessage = ev.payload['message'] as String? ?? 
+                            ev.payload['error'] as String? ??
+                            ev.payload['type'] as String? ??
+                            'Unknown gateway error';
         final errorCode = ev.payload['code'] as String?;
+        final errorType = ev.payload['type'] as String?;
+        final originalType = ev.payload['_original_type'] as String?;
         lastError = errorMessage;
         
         _logger.error('voice.gateway_error_received', data: {
           'message': errorMessage,
           'code': errorCode,
+          'type': errorType,
+          'original_type': originalType,
           'sequence': ev.seq,
-          'payload_keys': ev.payload.keys.toList(),
+          'payload_keys': ev.payload.keys.where((k) => k != '_original_type').toList(),
           'session_started': _sessionStarted,
           'server_ready': _serverReady,
           'mic_capture_active': _micCaptureActive,
         });
         
-        // Clear audio queue on error to prevent stale sends
-        _audioQueue.clear();
-        // Stop mic capture on error to prevent spam and resource waste
-        _micCaptureActive = false;
-        _serverReady = false;
-        _micMuted = false;
-        // Note: We do NOT set _sessionStarted = false here because the session
-        // might still be partially active (WebSocket might reconnect, etc.)
-        // Only stop() or dispose() should fully reset _sessionStarted.
-        unawaited(_stopMicCapture());
+        // Check if this is a transient error that we can recover from
+        final isTransientError = errorType == 'TRANSIENT' || 
+                                errorCode == 'TRANSIENT' ||
+                                errorMessage.toLowerCase().contains('transient') ||
+                                errorMessage.toLowerCase().contains('temporary');
         
-        // Check if this is a connection error that should trigger reconnect
-        if (_isConnectionError(errorMessage) && _shouldReconnect) {
-          _logger.warn('voice.connection_error_triggering_reconnect', data: {
+        if (isTransientError) {
+          // For transient errors, just log and continue - server should recover
+          _logger.warn('voice.transient_error_continuing', data: {
             'error': errorMessage,
+            'type': errorType,
           });
-          unawaited(_attemptReconnect());
+          // Don't change _serverReady or stop capture - let it continue
         } else {
-          _setState(VoiceUiState.error);
+          // For persistent errors, stop and potentially reconnect
+          // Clear audio queue on error to prevent stale sends
+          _audioQueue.clear();
+          // Stop mic capture on error to prevent spam and resource waste
+          _micCaptureActive = false;
+          _serverReady = false;
+          _micMuted = false;
+          // Note: We do NOT set _sessionStarted = false here because the session
+          // might still be partially active (WebSocket might reconnect, etc.)
+          // Only stop() or dispose() should fully reset _sessionStarted.
+          unawaited(_stopMicCapture());
+          
+          // Check if this is a connection error that should trigger reconnect
+          if (_isConnectionError(errorMessage) && _shouldReconnect) {
+            _logger.warn('voice.connection_error_triggering_reconnect', data: {
+              'error': errorMessage,
+            });
+            unawaited(_attemptReconnect());
+          } else {
+            _setState(VoiceUiState.error);
+          }
         }
+        break;
+      }
+
+      case GatewayEventType.unknown: {
+        // Log unknown event types for debugging but don't break the session
+        _logger.debug('voice.unknown_event_type_ignored', data: {
+          'original_type': ev.payload['_original_type'],
+          'sequence': ev.seq,
+          'payload_keys': ev.payload.keys.where((k) => k != '_original_type').toList(),
+          'payload_sample': ev.payload.keys
+              .where((k) => k != '_original_type')
+              .take(5)
+              .map((k) => '$k=${ev.payload[k]}')
+              .join(', '),
+        });
+        // Do nothing - just ignore unknown events
         break;
       }
     }
