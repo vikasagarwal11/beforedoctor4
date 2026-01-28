@@ -1,5 +1,11 @@
 include: package:flutter_lints/flutter.yaml
 
+analyzer:
+  exclude:
+    - "ChatGPT Files/**"
+    - "voice_ae_implementation_files/**"
+    - "voice_ae_review_package/**"
+
 linter:
   rules:
     prefer_single_quotes: true

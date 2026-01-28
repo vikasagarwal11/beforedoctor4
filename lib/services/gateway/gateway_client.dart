@@ -10,6 +10,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'gateway_protocol.dart';
@@ -25,7 +26,8 @@ abstract class IGatewayClient {
   });
 
   Future<void> sendAudioChunkBase64(String base64Pcm16k);
-  Future<void> sendAudioChunkBinary(Uint8List pcm16k); // Binary WebSocket frames
+  Future<void> sendAudioChunkBinary(
+      Uint8List pcm16k); // Binary WebSocket frames
   Future<void> sendTurnComplete();
   Future<void> sendBargeIn(); // Cancel server-side audio generation
   Future<void> sendStop();
@@ -36,6 +38,8 @@ class GatewayClient implements IGatewayClient {
   final _controller = StreamController<GatewayEvent>.broadcast();
   WebSocketChannel? _channel;
   bool _connected = false;
+  int _connectionSeq = 0;
+  bool _intentionalClose = false;
 
   @override
   Stream<GatewayEvent> get events => _controller.stream;
@@ -51,70 +55,113 @@ class GatewayClient implements IGatewayClient {
   }) async {
     await close();
 
-    _channel = WebSocketChannel.connect(url);
+    _intentionalClose = false;
+    final int conn = ++_connectionSeq;
+
+    // Use I/O channel to get a real connect timeout on mobile.
+    _channel = IOWebSocketChannel.connect(
+      url,
+      connectTimeout: const Duration(seconds: 6),
+    );
+
+    // Wait for handshake to complete so callers can rely on connect() completing.
+    await _channel!.ready.timeout(const Duration(seconds: 8));
     _connected = true;
 
-    // Send hello/auth handshake
-    _channel!.sink.add(clientHello(firebaseIdToken: firebaseIdToken, sessionConfig: sessionConfig));
-
+    // Start listening before sending hello to avoid missing early events.
     _channel!.stream.listen(
       (raw) {
+        if (conn != _connectionSeq) return;
         try {
-          // Guard: ignore binary frames (for future binary audio support)
-          if (raw is! String) {
-            // Binary frame received - ignore for now (can add binary audio later)
-            return;
-          }
+          // Gateway emits JSON string events; ignore binary frames.
+          if (raw is! String) return;
           final decoded = jsonDecode(raw) as Map<String, dynamic>;
           _controller.add(GatewayEvent.fromJson(decoded));
         } catch (_) {
-          _controller.add(GatewayEvent(type: GatewayEventType.error, payload: {'message': 'Malformed gateway message'}, seq: 0));
+          _controller.add(GatewayEvent(
+              type: GatewayEventType.error,
+              payload: {'message': 'Malformed gateway message'},
+              seq: 0));
         }
       },
       onError: (e) {
-        _controller.add(GatewayEvent(type: GatewayEventType.error, payload: {'message': e.toString()}, seq: 0));
+        if (conn != _connectionSeq) return;
+        _controller.add(GatewayEvent(
+            type: GatewayEventType.error,
+            payload: {'message': e.toString()},
+            seq: 0));
       },
       onDone: () {
+        if (conn != _connectionSeq) return;
         _connected = false;
+
+        // Only surface a disconnect if it wasn't a user/system initiated close.
+        if (!_intentionalClose) {
+          _controller.add(
+            const GatewayEvent(
+              type: GatewayEventType.error,
+              payload: {'message': 'Gateway disconnected'},
+              seq: 0,
+            ),
+          );
+        }
       },
       cancelOnError: false,
     );
+
+    // Send hello/auth handshake
+    _channel!.sink.add(clientHello(
+      firebaseIdToken: firebaseIdToken,
+      sessionConfig: sessionConfig,
+    ));
   }
 
   @override
   Future<void> sendAudioChunkBase64(String base64Pcm16k) async {
-    if (_channel == null) return;
+    if (_channel == null || !_connected) {
+      throw StateError('Gateway not connected');
+    }
     _channel!.sink.add(clientAudioChunk(base64Pcm16k: base64Pcm16k));
   }
 
-  /// Send audio as binary frame (performance optimization - no base64 overhead)
-  /// Use this instead of sendAudioChunkBase64 for lower latency
+  @override
   Future<void> sendAudioChunkBinary(Uint8List pcm16k) async {
-    if (_channel == null) return;
-    // Send raw PCM bytes as WebSocket binary frame
+    if (_channel == null || !_connected) {
+      throw StateError('Gateway not connected');
+    }
+    // Gateway supports binary PCM frames.
     _channel!.sink.add(pcm16k);
   }
 
   @override
   Future<void> sendTurnComplete() async {
-    if (_channel == null) return;
+    if (_channel == null || !_connected) {
+      throw StateError('Gateway not connected');
+    }
     _channel!.sink.add(clientTurnComplete());
   }
 
   @override
   Future<void> sendBargeIn() async {
-    if (_channel == null) return;
+    if (_channel == null || !_connected) {
+      throw StateError('Gateway not connected');
+    }
     _channel!.sink.add(clientBargeIn());
   }
 
   @override
   Future<void> sendStop() async {
-    if (_channel == null) return;
+    if (_channel == null || !_connected) {
+      throw StateError('Gateway not connected');
+    }
     _channel!.sink.add(clientStop());
   }
 
   @override
   Future<void> close() async {
+    // Invalidate any in-flight listeners so their onDone/onError won't affect a new connection.
+    _intentionalClose = true;
+    _connectionSeq++;
     _connected = false;
     await _channel?.sink.close();
     _channel = null;

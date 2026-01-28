@@ -27,7 +27,8 @@ class AppState extends ChangeNotifier {
   double _textScale = 0.92; // Default to 0.92 as requested
   VoiceTone _voiceTone = VoiceTone.adult;
   bool _handsFree = false;
-  VoiceCharacterStyle _voiceCharacterStyle = VoiceCharacterStyle.teddyBear; // Default to Teddy Bear
+  VoiceCharacterStyle _voiceCharacterStyle =
+      VoiceCharacterStyle.teddyBear; // Default to Teddy Bear
 
   bool get offline => _offline;
   bool get dense => _dense;
@@ -68,19 +69,28 @@ class AppState extends ChangeNotifier {
 }
 
 class AppStateScope extends InheritedNotifier<AppState> {
-  const AppStateScope({super.key, required AppState state, required super.child}) : super(notifier: state);
+  const AppStateScope(
+      {super.key, required AppState state, required super.child})
+      : super(notifier: state);
+
+  static final AppState _fallbackState = AppState();
+  static bool _warnedMissingScope = false;
 
   static AppState of(BuildContext context) {
     final scope = context.dependOnInheritedWidgetOfExactType<AppStateScope>();
     if (scope == null) {
-      // Fallback: create a default AppState if scope not found
-      // This can happen during hot reload or widget tree reconstruction
-      debugPrint('Warning: AppStateScope not found in widget tree, using default state');
-      return AppState();
+      // Fallback: return a stable default state if scope not found.
+      // This should be rare; log only once to avoid spamming.
+      if (!_warnedMissingScope) {
+        _warnedMissingScope = true;
+        debugPrint(
+            'Warning: AppStateScope not found in widget tree; using fallback state');
+      }
+      return _fallbackState;
     }
     return scope.notifier!;
   }
-  
+
   /// Safe version that returns null instead of throwing
   static AppState? maybeOf(BuildContext context) {
     final scope = context.dependOnInheritedWidgetOfExactType<AppStateScope>();

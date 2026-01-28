@@ -5,9 +5,9 @@
  * Convert Vertex AI session events to gateway protocol events
  */
 export class GatewayEventHandler {
-  constructor(sendEventCallback) {
+  constructor(sendEventCallback, initialSeq = 0) {
     this.sendEvent = sendEventCallback;
-    this.seq = 0;
+    this.seq = Number.isFinite(initialSeq) ? initialSeq : 0;
   }
 
   /**

@@ -11,17 +11,19 @@
 import 'dart:convert';
 
 enum GatewayEventType {
-  sessionState,            // server.session.state
-  userTranscriptPartial,   // server.user.transcript.partial
-  userTranscriptFinal,     // server.user.transcript.final
-  transcriptPartial,       // server.transcript.partial
-  transcriptFinal,         // server.transcript.final
-  narrativeUpdate,         // server.narrative.update  (string or patch)
-  aeDraftUpdate,           // server.ae_draft.update   (json patch)
-  audioOut,                // server.audio.out        (base64 pcm24k s16le)
-  audioStop,               // server.audio.stop       (barge-in / flush playback)
-  emergency,               // server.triage.emergency
-  error,                   // server.error
+  gatewayInfo, // server.gateway.info
+  kpi, // server.kpi
+  sessionState, // server.session.state
+  userTranscriptPartial, // server.user.transcript.partial
+  userTranscriptFinal, // server.user.transcript.final
+  transcriptPartial, // server.transcript.partial
+  transcriptFinal, // server.transcript.final
+  narrativeUpdate, // server.narrative.update  (string or patch)
+  aeDraftUpdate, // server.ae_draft.update   (json patch)
+  audioOut, // server.audio.out        (base64 pcm24k s16le)
+  audioStop, // server.audio.stop       (barge-in / flush playback)
+  emergency, // server.triage.emergency
+  error, // server.error
 }
 
 /// Canonical envelope: { type: string, payload: object, seq?: int }
@@ -30,7 +32,8 @@ class GatewayEvent {
   final Map<String, dynamic> payload;
   final int seq;
 
-  const GatewayEvent({required this.type, required this.payload, required this.seq});
+  const GatewayEvent(
+      {required this.type, required this.payload, required this.seq});
 
   static GatewayEvent fromJson(Map<String, dynamic> json) {
     final t = json['type'] as String? ?? '';
@@ -38,13 +41,18 @@ class GatewayEvent {
 
     return GatewayEvent(
       type: _mapType(t),
-      payload: (json['payload'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{},
+      payload: (json['payload'] as Map?)?.cast<String, dynamic>() ??
+          const <String, dynamic>{},
       seq: seq,
     );
   }
 
   static GatewayEventType _mapType(String t) {
     switch (t) {
+      case 'server.gateway.info':
+        return GatewayEventType.gatewayInfo;
+      case 'server.kpi':
+        return GatewayEventType.kpi;
       case 'server.session.state':
         return GatewayEventType.sessionState;
       case 'server.user.transcript.partial':

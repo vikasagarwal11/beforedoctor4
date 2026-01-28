@@ -52,8 +52,8 @@ class DefaultFirebaseOptions {
   }
 
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyDS8J7TdaC9HhmNrtAlfkmRTGQxlWYMBG4',
-    appId: '1:930239596443:android:YOUR_ANDROID_APP_ID', // TODO: Get from Firebase Console
+    apiKey: 'AIzaSyAbqWxZA0L8pldUuFAlND8tuzlV09xZJW0',
+    appId: '1:930239596443:android:42034f760a3fc68745833e',
     messagingSenderId: '930239596443',
     projectId: 'beforedoctor4',
     storageBucket: 'beforedoctor4.firebasestorage.app',

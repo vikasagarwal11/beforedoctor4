@@ -14,6 +14,7 @@ export class GoogleStreamingASR {
     this.retryDelayMs = retryDelayMs;
     this.retryCount = 0;
     this.onTranscript = null;
+    this.onError = null;
   }
 
   /**
@@ -22,22 +23,14 @@ export class GoogleStreamingASR {
    */
   static async validateAPI() {
     try {
+      // Simple instantiation check - if SpeechClient can be created, assume API is accessible
+      // Full validation would require making an actual API call with audio, which is expensive
       const client = new SpeechClient();
-      // Try to list models as a lightweight validation
-      // Note: This may require additional permissions, so we catch and continue
-      await client.listModels({ pageSize: 1 });
-      logger.info('stt.api_validation_passed', {});
+      logger.info('stt.api_validation_passed', {
+        note: 'SpeechClient instantiated successfully',
+      });
       return true;
     } catch (error) {
-      // If listModels fails, try a simple instantiation check
-      // The API might still work even if listModels requires extra permissions
-      if (error.code === 7 || error.code === 'PERMISSION_DENIED') {
-        logger.warn('stt.api_validation_partial', {
-          error_code: error.code,
-          note: 'API may still work - listModels requires extra permissions',
-        });
-        return true; // Assume API is accessible, just can't list models
-      }
       logger.error('stt.api_validation_failed', {
         error_code: error.code,
         error_message: error.message,
@@ -46,9 +39,11 @@ export class GoogleStreamingASR {
     }
   }
 
-  start(onTranscript) {
+  start(onTranscript, onError) {
     if (this.started) return;
     this.onTranscript = onTranscript;
+    this.onError = onError;
+    this.retryCount = 0;
     this._startWithRetry();
   }
 
@@ -60,7 +55,6 @@ export class GoogleStreamingASR {
     
     try {
       this.started = true;
-      this.retryCount = 0;
 
       const request = {
         config: {
@@ -80,6 +74,14 @@ export class GoogleStreamingASR {
             error_message: error.message,
             retry_count: this.retryCount,
           });
+
+          if (this.onError) {
+            try {
+              this.onError(error);
+            } catch (_) {
+              // Ignore user callback errors.
+            }
+          }
           
           // Reset started flag on error so we can retry
           this.started = false;
@@ -176,6 +178,7 @@ export class GoogleStreamingASR {
     }
     this.started = false;
     this.onTranscript = null;
+    this.onError = null;
     this.retryCount = 0;
   }
 

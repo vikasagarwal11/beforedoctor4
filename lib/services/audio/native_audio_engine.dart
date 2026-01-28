@@ -14,8 +14,8 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:audio_session/audio_session.dart';
-import 'package:flutter_sound/flutter_sound.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
+import 'package:flutter_sound/flutter_sound.dart';
 
 import '../../services/logging/app_logger.dart';
 import 'audio_engine_service.dart';
@@ -37,56 +37,51 @@ class NativeAudioEngine implements IAudioEngine {
 class _NativeCapture implements IAudioCapture {
   static const int _targetSampleRate = 16000;
   static const int _targetChannels = 1;
-  
+
   // Fixed 20ms chunks (640 bytes at 16kHz) for deterministic latency
   // At 16kHz, 16-bit mono: 16,000 samples/sec * 2 bytes/sample = 32,000 bytes/sec
   // 20ms = 0.02 sec * 32,000 bytes/sec = 640 bytes
   static const int _fixedChunkBytes = 640; // 20ms at 16kHz: (16000 * 0.02 * 2)
-  static const int _minChunkBytes = 320; // Minimum acceptable (10ms)
   static const int _maxChunkBytes = 640; // Maximum (20ms)
 
   bool _isCapturing = false;
   FlutterSoundRecorder? _recorder;
   StreamSubscription<Uint8List>? _sub;
   StreamController<Uint8List>? _streamController;
-  
+
   // Buffering state
   final List<int> _audioBuffer = [];
-  Timer? _chunkTimer;
-  void Function(Uint8List pcm16k)? _onPcm16kCallback; // Store callback for final flush
-  
-  // Sample rate detection
-  int? _deviceSampleRate;
-  bool _needsResampling = false;
-  _AudioResampler? _resampler;
-  final List<int> _chunkSizeHistory = []; // For sample rate detection
-  DateTime? _firstChunkTime;
-  int _totalBytesReceived = 0;
+  void Function(Uint8List pcm16k)?
+      _onPcm16kCallback; // Store callback for final flush
+
+  // No sample rate detection on Android - use 16kHz always
+  // iOS can be added later if needed with explicit negotiation
   int _chunkCounter = 0; // For logging
-  
+
   final AppLogger _logger = AppLogger.instance;
 
   @override
   bool get isCapturing => _isCapturing;
 
   @override
-  Future<void> start({required void Function(Uint8List pcm16k) onPcm16k}) async {
+  Future<void> start(
+      {required void Function(Uint8List pcm16k) onPcm16k}) async {
     if (_isCapturing) {
       _logger.warn('audio.capture_already_active');
       return;
     }
-    
+
     try {
       // Configure iOS audio session before starting
       await _configureAudioSession();
-      
+
       _isCapturing = true;
       _audioBuffer.clear();
       _onPcm16kCallback = onPcm16k; // Store callback for final flush
 
       // Reuse existing recorder if available, otherwise create new one
       _recorder ??= FlutterSoundRecorder();
-      
+
       // Only open if not already open
       if (!(_recorder!.isRecording || _recorder!.isPaused)) {
         await _recorder!.openRecorder();
@@ -95,13 +90,14 @@ class _NativeCapture implements IAudioCapture {
       // Create stream controller for audio data
       _streamController = StreamController<Uint8List>.broadcast();
 
-      // Listen to the stream and process with buffering/resampling
+      // Listen to the stream and process directly (no buffering/resampling)
       _sub = _streamController!.stream.listen((data) {
         if (!_isCapturing) return;
+        // Process each incoming chunk directly as 20ms frames
         _processAudioChunk(data, onPcm16k);
       });
 
-      // Start recording - try to get native 16kHz, but we'll handle resampling if needed
+      // Start recording at native 16kHz, mono, PCM16
       await _recorder!.startRecorder(
         toStream: _streamController!.sink,
         codec: Codec.pcm16,
@@ -109,23 +105,10 @@ class _NativeCapture implements IAudioCapture {
         numChannels: _targetChannels,
       );
 
-      // Initialize sample rate detection
-      _deviceSampleRate = _targetSampleRate; // Assume correct until proven otherwise
-      _needsResampling = false;
-      _resampler = null;
-      _chunkSizeHistory.clear();
-      _firstChunkTime = null;
-      _totalBytesReceived = 0;
-
       _logger.info('audio.capture_started', data: {
-        'requested_rate': _targetSampleRate,
-        'device_rate': _deviceSampleRate,
-        'needs_resampling': _needsResampling,
-      });
-
-      // Start periodic chunk sending (every 20ms for fixed deterministic chunks)
-      _chunkTimer = Timer.periodic(const Duration(milliseconds: 20), (_) {
-        _flushBuffer(onPcm16k);
+        'sample_rate': _targetSampleRate,
+        'channels': _targetChannels,
+        'fixed_chunk_ms': 20,
       });
     } catch (e) {
       _isCapturing = false;
@@ -139,20 +122,25 @@ class _NativeCapture implements IAudioCapture {
       final session = await AudioSession.instance;
       await session.configure(AudioSessionConfiguration(
         avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
-        avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.defaultToSpeaker |
-            AVAudioSessionCategoryOptions.allowBluetooth,
-        avAudioSessionMode: AVAudioSessionMode.defaultMode,
-        avAudioSessionRouteSharingPolicy: AVAudioSessionRouteSharingPolicy.defaultPolicy,
+        avAudioSessionCategoryOptions:
+            AVAudioSessionCategoryOptions.defaultToSpeaker |
+                AVAudioSessionCategoryOptions.allowBluetooth,
+        // Prefer speech processing / echo control where the OS supports it.
+        avAudioSessionMode: AVAudioSessionMode.spokenAudio,
+        avAudioSessionRouteSharingPolicy:
+            AVAudioSessionRouteSharingPolicy.defaultPolicy,
         avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
         androidAudioAttributes: const AndroidAudioAttributes(
           contentType: AndroidAudioContentType.speech,
           flags: AndroidAudioFlags.none,
           usage: AndroidAudioUsage.voiceCommunication,
         ),
-        androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
-        androidWillPauseWhenDucked: false,
+        // Prefer exclusive transient focus to reduce interruptions while capturing speech.
+        androidAudioFocusGainType:
+            AndroidAudioFocusGainType.gainTransientExclusive,
+        androidWillPauseWhenDucked: true,
       ));
-      
+
       await session.setActive(true);
       _logger.info('audio.session_configured', data: {
         'category': 'playAndRecord',
@@ -160,87 +148,70 @@ class _NativeCapture implements IAudioCapture {
       });
     } catch (e) {
       // Log but don't fail - some platforms may not support all options
-      _logger.warn('audio.session_config_failed', data: {'error': e.toString()});
+      _logger
+          .warn('audio.session_config_failed', data: {'error': e.toString()});
     }
   }
 
-  void _processAudioChunk(Uint8List rawData, void Function(Uint8List pcm16k) onPcm16k) {
+  void _processAudioChunk(
+      Uint8List rawData, void Function(Uint8List pcm16k) onPcm16k) {
     if (!_isCapturing) return;
 
-    // Track chunk for sample rate detection
-    _chunkSizeHistory.add(rawData.length);
-    _totalBytesReceived += rawData.length;
-    _firstChunkTime ??= DateTime.now();
-    
-    // Log audio capture (first chunk and every 50th chunk to avoid spam)
-    if (_chunkSizeHistory.length == 1 || _chunkSizeHistory.length % 50 == 0) {
+    // Target: 640 bytes for 20ms @ 16kHz mono 16-bit
+    const targetChunkBytes = 640;
+
+    // If chunk is larger than expected, split it into proper-sized chunks
+    if (rawData.length > targetChunkBytes * 1.5) {
+      // Split large chunk into multiple 640-byte chunks
+      int offset = 0;
+      while (offset + targetChunkBytes <= rawData.length) {
+        final chunk =
+            Uint8List.sublistView(rawData, offset, offset + targetChunkBytes);
+        onPcm16k(chunk);
+        offset += targetChunkBytes;
+      }
+      // Send remaining bytes if any (keep in buffer for next chunk)
+      if (offset < rawData.length) {
+        final remainder = Uint8List.sublistView(rawData, offset);
+        _audioBuffer.addAll(remainder);
+      }
+      return;
+    }
+
+    // If we have buffered data, combine with new chunk
+    if (_audioBuffer.isNotEmpty) {
+      _audioBuffer.addAll(rawData);
+
+      // Extract complete chunks from buffer
+      while (_audioBuffer.length >= targetChunkBytes) {
+        final chunk =
+            Uint8List.fromList(_audioBuffer.sublist(0, targetChunkBytes));
+        _audioBuffer.removeRange(0, targetChunkBytes);
+
+        _chunkCounter++;
+        if (_chunkCounter % 50 == 0) {
+          _logger.info('audio.capture_chunk_processed', data: {
+            'chunk_size_bytes': chunk.length,
+            'chunk_number': _chunkCounter,
+            'buffer_remaining': _audioBuffer.length,
+          });
+        }
+
+        onPcm16k(chunk);
+      }
+      return;
+    }
+
+    // Normal case: chunk is approximately correct size
+    _chunkCounter++;
+    if (_chunkCounter % 50 == 0) {
       _logger.info('audio.capture_chunk_received', data: {
         'chunk_size_bytes': rawData.length,
-        'total_chunks': _chunkSizeHistory.length,
-        'total_bytes': _totalBytesReceived,
-        'is_capturing': _isCapturing,
+        'chunk_number': _chunkCounter,
       });
     }
 
-    // Detect sample rate after collecting enough data (first 500ms)
-    if (!_needsResampling && _chunkSizeHistory.length >= 10) {
-      _detectSampleRate();
-    }
-
-    // Resample if needed
-    final processedData = _needsResampling && _resampler != null
-        ? _resampler!.resample(rawData)
-        : rawData;
-
-    // Convert to List<int> and add to buffer
-    _audioBuffer.addAll(processedData.toList());
-    
-    // If buffer exceeds max chunk size, flush immediately to prevent lag
-    if (_audioBuffer.length >= _maxChunkBytes) {
-      _flushBuffer(onPcm16k);
-    }
-  }
-
-  /// Detects actual device sample rate by analyzing chunk arrival rates
-  void _detectSampleRate() {
-    if (_chunkSizeHistory.length < 10 || _firstChunkTime == null) return;
-
-    final elapsed = DateTime.now().difference(_firstChunkTime!).inMilliseconds;
-    if (elapsed < 500) return; // Need at least 500ms of data
-
-    // Calculate average bytes per second
-    final avgBytesPerSecond = (_totalBytesReceived / elapsed) * 1000;
-    
-    // At 16kHz, 16-bit mono: 32,000 bytes/sec
-    // If we're getting significantly more, device is likely providing higher sample rate
-    const expectedBytesPerSecond = _targetSampleRate * 2; // 16-bit = 2 bytes/sample
-    
-    final ratio = avgBytesPerSecond / expectedBytesPerSecond;
-    
-    // If ratio is significantly different from 1.0, we need resampling
-    if (ratio < 0.9 || ratio > 1.1) {
-      // Estimate actual sample rate
-      final estimatedRate = (_targetSampleRate * ratio).round();
-      
-      // Only enable resampling if significantly different (more than 10%)
-      if ((estimatedRate - _targetSampleRate).abs() > _targetSampleRate * 0.1) {
-        _deviceSampleRate = estimatedRate;
-        _needsResampling = true;
-        _resampler = _AudioResampler(_deviceSampleRate!, _targetSampleRate);
-        
-        _logger.warn('audio.sample_rate_mismatch_detected', data: {
-          'requested': _targetSampleRate,
-          'detected': _deviceSampleRate,
-          'ratio': ratio.toStringAsFixed(2),
-          'enabling_resampling': true,
-        });
-      }
-    } else {
-      // Sample rate is correct
-      _deviceSampleRate = _targetSampleRate;
-      _needsResampling = false;
-      _resampler = null;
-    }
+    onPcm16k(rawData);
   }
 
   void _flushBuffer(void Function(Uint8List pcm16k) onPcm16k) {
@@ -267,7 +238,7 @@ class _NativeCapture implements IAudioCapture {
 
     // Convert to Uint8List and send
     final pcm16k = Uint8List.fromList(chunk);
-    
+
     // Log when audio chunk is sent to controller (every 10th chunk to avoid spam)
     _chunkCounter++;
     if (_chunkCounter % 10 == 0) {
@@ -277,7 +248,7 @@ class _NativeCapture implements IAudioCapture {
         'buffer_remaining_bytes': _audioBuffer.length,
       });
     }
-    
+
     onPcm16k(pcm16k);
   }
 
@@ -287,42 +258,35 @@ class _NativeCapture implements IAudioCapture {
       _logger.debug('audio.capture_already_stopped');
       return;
     }
-    
+
     _isCapturing = false;
-    
-    // Cancel timer
-    _chunkTimer?.cancel();
-    _chunkTimer = null;
-    
+
     // Flush any remaining buffer - ALWAYS forward it to callback, even if small
     // This prevents dropping the final 10-20ms of speech
     if (_audioBuffer.isNotEmpty && _onPcm16kCallback != null) {
       final pcm16k = Uint8List.fromList(_audioBuffer);
       _audioBuffer.clear();
-      _logger.debug('audio.flushing_final_buffer', data: {'bytes': pcm16k.length});
-      
+      _logger
+          .debug('audio.flushing_final_buffer', data: {'bytes': pcm16k.length});
+
       // Forward final buffer to callback (even if smaller than minChunkBytes)
       _onPcm16kCallback!(pcm16k);
     } else if (_audioBuffer.isNotEmpty) {
       // No callback available, just clear
-      _logger.debug('audio.discarding_final_buffer_no_callback', data: {'bytes': _audioBuffer.length});
+      _logger.debug('audio.discarding_final_buffer_no_callback',
+          data: {'bytes': _audioBuffer.length});
       _audioBuffer.clear();
     }
-    
+
     // Clear callback reference
     _onPcm16kCallback = null;
-    
-    // Reset sample rate detection state
-    _chunkSizeHistory.clear();
-    _firstChunkTime = null;
-    _totalBytesReceived = 0;
-    _resampler = null;
+
     _chunkCounter = 0;
-    
+
     try {
       await _sub?.cancel();
       _sub = null;
-      
+
       if (_recorder != null) {
         if (_recorder!.isRecording) {
           await _recorder!.stopRecorder();
@@ -331,7 +295,7 @@ class _NativeCapture implements IAudioCapture {
         // Keep recorder instance for reuse (don't null it out)
         // This prevents creating multiple instances
       }
-      
+
       await _streamController?.close();
       _streamController = null;
     } catch (e) {
@@ -339,17 +303,18 @@ class _NativeCapture implements IAudioCapture {
       // Reset recorder on error to allow recovery
       _recorder = null;
     }
-    
+
     _logger.info('audio.capture_stopped');
   }
-  
+
   /// Dispose of the recorder completely (for cleanup)
   Future<void> dispose() async {
     await stop();
     try {
       await _recorder?.closeRecorder();
     } catch (e) {
-      _logger.debug('audio.capture_dispose_error', data: {'error': e.toString()});
+      _logger
+          .debug('audio.capture_dispose_error', data: {'error': e.toString()});
     }
     _recorder = null;
   }
@@ -433,95 +398,138 @@ class _NativePlayback implements IAudioPlayback {
   static const int _targetSampleRate = 24000;
   static const int _targetChannels = 1;
 
-  bool _prepared = false;
+  bool _setupInitiated = false;
+  bool _setupComplete = false;
   final AppLogger _logger = AppLogger.instance;
 
   @override
-  bool get isPlaying => _prepared;
+  bool get isPlaying => _setupComplete;
 
+  /// Setup: One-time initialization of audio session
+  /// Must be called before any play/feed operations
   @override
-  Future<void> prepare() async {
-    if (_prepared) return;
-    
+  Future<void> setup() async {
+    if (_setupInitiated) {
+      _logger.debug('audio.playback_setup_already_initiated');
+      return;
+    }
+
+    _setupInitiated = true;
+
     try {
-      // First, ensure any previous session is fully stopped
+      // Guard: Safely stop any previous session
       try {
         await FlutterPcmSound.stop();
-        _logger.debug('audio.playback_pre_cleanup');
+        _logger.debug('audio.playback_pre_setup_stop');
       } catch (e) {
         // Ignore errors from stopping non-existent session
-        _logger.debug('audio.playback_pre_cleanup_ignored', data: {'error': e.toString()});
+        _logger.debug('audio.playback_pre_setup_stop_ignored',
+            data: {'error': e.toString()});
       }
-      
-      // Small delay to let iOS audio session settle
+
+      // Small delay to let audio session settle
       await Future.delayed(const Duration(milliseconds: 100));
-      
-      // Now set up the audio session
+
+      // Initialize audio session
       await FlutterPcmSound.setup(
         sampleRate: _targetSampleRate,
         channelCount: _targetChannels,
       );
       await FlutterPcmSound.play();
-      _prepared = true;
-      _logger.info('audio.playback_prepared', data: {
+      _setupComplete = true;
+      _logger.info('audio.playback_setup_complete', data: {
         'sample_rate': _targetSampleRate,
         'channels': _targetChannels,
       });
     } catch (e) {
-      _logger.error('audio.playback_prepare_failed', error: e);
-      _prepared = false;
+      _setupInitiated = false;
+      _setupComplete = false;
+      _logger.error('audio.playback_setup_failed', error: e);
       rethrow;
     }
   }
 
+  /// Deprecated: Use setup() instead
+  @Deprecated('Use setup() instead')
+  @override
+  Future<void> prepare() async => setup();
+
   @override
   Future<void> feed(Uint8List pcm24k) async {
-    if (!_prepared) {
-      await prepare();
+    // Guard: ensure setup happened first
+    if (!_setupComplete) {
+      _logger.warn('audio.feed_before_setup', data: {
+        'setup_initiated': _setupInitiated,
+        'setup_complete': _setupComplete,
+      });
+      await setup();
     }
-    
+
     try {
-      // Validate chunk size (optional, but good for debugging)
       if (pcm24k.isEmpty) {
         _logger.warn('audio.empty_playback_chunk');
         return;
       }
-      
+
       // Convert Uint8List to ByteData for PcmArrayInt16
-      final byteData = pcm24k.buffer.asByteData(pcm24k.offsetInBytes, pcm24k.length);
+      final byteData =
+          pcm24k.buffer.asByteData(pcm24k.offsetInBytes, pcm24k.length);
       await FlutterPcmSound.feed(PcmArrayInt16(bytes: byteData));
     } catch (e) {
       _logger.warn('audio.playback_feed_failed', data: {'error': e.toString()});
     }
   }
 
+  /// Stop playback and flush buffers
+  /// Safe to call even if not playing
   @override
-  Future<void> stopNow() async {
-    // Critical for barge-in: this flushes internal buffers immediately.
-    if (!_prepared) return; // Already stopped
-    
+  Future<void> stop() async {
+    if (!_setupInitiated) {
+      _logger.debug('audio.playback_stop_not_initialized');
+      return;
+    }
+
     try {
       await FlutterPcmSound.stop();
-      _prepared = false;
-      // Note: Do NOT re-prepare here. The prepare() call should be done explicitly
-      // before the next feed() call. Re-preparing here can cause AVAudioSession errors
-      // when called during session teardown or error handling.
-      _logger.debug('audio.playback_flushed');
+      _setupComplete = false;
+      _logger.debug('audio.playback_stopped');
     } catch (e) {
+      _setupComplete = false;
       _logger.warn('audio.playback_stop_failed', data: {'error': e.toString()});
-      _prepared = false;
+    }
+  }
+
+  /// Immediate stop alias to satisfy IAudioPlayback
+  /// Uses the same guarded stop implementation
+  @override
+  Future<void> stopNow() async {
+    await stop();
+  }
+
+  /// Cleanup: Release audio resources completely
+  /// Called at session end, safe even if partially initialized
+  @override
+  Future<void> cleanup() async {
+    if (!_setupInitiated) {
+      _logger.debug('audio.playback_cleanup_not_needed');
+      return;
+    }
+
+    try {
+      await FlutterPcmSound.stop();
+      _setupInitiated = false;
+      _setupComplete = false;
+      _logger.info('audio.playback_cleanup_complete');
+    } catch (e) {
+      _setupInitiated = false;
+      _setupComplete = false;
+      _logger
+          .warn('audio.playback_cleanup_failed', data: {'error': e.toString()});
     }
   }
 
   @override
   Future<void> dispose() async {
-    try {
-      await FlutterPcmSound.stop();
-      _prepared = false;
-      _logger.info('audio.playback_disposed');
-    } catch (e) {
-      _logger.warn('audio.playback_dispose_failed', data: {'error': e.toString()});
-      _prepared = false;
-    }
+    await cleanup();
   }
 }

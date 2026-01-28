@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
-import '../screens/voice_screen.dart';
+
+import '../voice_session_controller_v2.dart';
 
 class MicButton extends StatefulWidget {
   const MicButton({
@@ -23,9 +24,13 @@ class _MicButtonState extends State<MicButton> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
-    _pulse = AnimationController(vsync: this, duration: const Duration(milliseconds: 1200))..repeat();
-    _press = AnimationController(vsync: this, duration: const Duration(milliseconds: 120));
-    _pressScale = Tween<double>(begin: 1.0, end: 1.06).animate(CurvedAnimation(parent: _press, curve: Curves.easeOut));
+    _pulse = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 1200))
+      ..repeat();
+    _press = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 120));
+    _pressScale = Tween<double>(begin: 1.0, end: 1.06)
+        .animate(CurvedAnimation(parent: _press, curve: Curves.easeOut));
   }
 
   @override
@@ -109,4 +114,3 @@ class _MicButtonState extends State<MicButton> with TickerProviderStateMixin {
     );
   }
 }
-

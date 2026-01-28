@@ -31,14 +31,27 @@ abstract class IAudioCapture {
 abstract class IAudioPlayback {
   bool get isPlaying;
 
+  /// Setup audio session (called once at start)
+  /// Initializes platform-specific audio session configuration
+  Future<void> setup();
+
   /// Prepares speaker playback for PCM s16le, mono, 24kHz.
+  /// Deprecated: Use setup() instead for one-time initialization
+  @Deprecated('Use setup() instead')
   Future<void> prepare();
 
   /// Feeds a PCM 24kHz chunk to the speaker.
   Future<void> feed(Uint8List pcm24k);
 
-  /// Stop playback immediately and flush buffers (required for barge-in).
-  Future<void> stopNow();
+  /// Stop playback and flush buffers (safe to call even if not playing)
+  Future<void> stop();
+
+  /// Cleanup and release audio resources (called at session end)
+  Future<void> cleanup();
+
+  /// Stop playback immediately (for barge-in / emergency)
+  /// Alias for stop() with emphasis on immediate effect
+  Future<void> stopNow() => stop();
 
   Future<void> dispose();
 }
@@ -66,12 +79,15 @@ class _NoOpCapture implements IAudioCapture {
   bool get isCapturing => _capturing;
 
   @override
-  Future<void> start({required void Function(Uint8List pcm16k) onPcm16k}) async {
+  Future<void> start(
+      {required void Function(Uint8List pcm16k) onPcm16k}) async {
     _capturing = true;
     _logger.info('audio.noop_capture_started', data: {
-      'note': 'Mock mode - no actual audio capture. Audio chunks will not be generated.',
+      'note':
+          'Mock mode - no actual audio capture. Audio chunks will not be generated.',
       'is_capturing': _capturing,
-      'warning': 'To test real audio capture, set useMockGateway: false and use NativeAudioEngine',
+      'warning':
+          'To test real audio capture, set useMockGateway: false and use NativeAudioEngine',
     });
     // no-op - this is intentional for mock mode
     // In mock mode, we don't generate audio chunks because there's no real microphone
@@ -91,6 +107,12 @@ class _NoOpPlayback implements IAudioPlayback {
   bool get isPlaying => _playing;
 
   @override
+  Future<void> setup() async {
+    _playing = true;
+  }
+
+  @Deprecated('Use setup() instead')
+  @override
   Future<void> prepare() async {
     _playing = true;
   }
@@ -98,6 +120,16 @@ class _NoOpPlayback implements IAudioPlayback {
   @override
   Future<void> feed(Uint8List pcm24k) async {
     // no-op
+  }
+
+  @override
+  Future<void> stop() async {
+    _playing = false;
+  }
+
+  @override
+  Future<void> cleanup() async {
+    _playing = false;
   }
 
   @override

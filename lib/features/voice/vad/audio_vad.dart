@@ -3,11 +3,11 @@ import 'dart:typed_data';
 
 /// VAD sensitivity presets for different environments
 enum VadSensitivity {
-  veryLow,    // Noisy environments (car, street, kids, construction)
-  low,        // Moderate noise (office, cafe, open space)
-  medium,     // Normal quiet environment (default)
-  high,       // Quiet room, low background noise
-  veryHigh,   // Studio/silent environment
+  veryLow, // Noisy environments (car, street, kids, construction)
+  low, // Moderate noise (office, cafe, open space)
+  medium, // Normal quiet environment (default)
+  high, // Quiet room, low background noise
+  veryHigh, // Studio/silent environment
 }
 
 /// Lightweight energy-based VAD with adaptive noise floor.
@@ -54,6 +54,8 @@ class AudioVad {
   int _lastVoiceMs = 0;
   int _speechStartMs = 0;
 
+  double _lastFrameDb = -90.0;
+
   bool _inSpeech = false;
   bool _endpointArmed = false;
 
@@ -62,8 +64,10 @@ class AudioVad {
     switch (sensitivity) {
       case VadSensitivity.veryLow:
         return AudioVad(
-          speechDbAboveNoise: 16.0,  // Higher threshold (less sensitive to noise)
-          commitSilenceMs: 2000,     // Longer pause (prevent cutting off in noisy env)
+          speechDbAboveNoise:
+              16.0, // Higher threshold (less sensitive to noise)
+          commitSilenceMs:
+              2000, // Longer pause (prevent cutting off in noisy env)
           minSpeechMsBeforeCommit: 500,
         );
       case VadSensitivity.low:
@@ -76,8 +80,8 @@ class AudioVad {
         return AudioVad(); // Default
       case VadSensitivity.high:
         return AudioVad(
-          speechDbAboveNoise: 10.0,  // Lower threshold (more sensitive)
-          commitSilenceMs: 1400,     // Shorter pause (faster response)
+          speechDbAboveNoise: 10.0, // Lower threshold (more sensitive)
+          commitSilenceMs: 1400, // Shorter pause (faster response)
           minSpeechMsBeforeCommit: 300,
         );
       case VadSensitivity.veryHigh:
@@ -121,12 +125,14 @@ class AudioVad {
     _lastFrameMs = nowMs;
 
     final db = _dbfsFromPcm16le(pcm16leBytes);
+    _lastFrameDb = db;
 
     // Calibration: first 400-600ms we assume mostly background to set a baseline.
     if (_calibrating) {
       if (nowMs - _calibrationStartMs < 600) {
         // move noise floor toward observed db slowly (conservative).
-        _noiseFloorDb = _lerp(_noiseFloorDb, _clamp(db, minNoiseDb, maxNoiseDb), 0.08);
+        _noiseFloorDb =
+            _lerp(_noiseFloorDb, _clamp(db, minNoiseDb, maxNoiseDb), 0.08);
         return;
       } else {
         _calibrating = false;
@@ -137,7 +143,8 @@ class AudioVad {
     // This keeps noise floor adaptive without drifting upward during speech.
     final isNearNoise = db < (_noiseFloorDb + 3.0);
     if (!_inSpeech || isNearNoise) {
-      _noiseFloorDb = _lerp(_noiseFloorDb, _clamp(db, minNoiseDb, maxNoiseDb), noiseLerp);
+      _noiseFloorDb =
+          _lerp(_noiseFloorDb, _clamp(db, minNoiseDb, maxNoiseDb), noiseLerp);
     }
 
     final speechThresholdDb = _noiseFloorDb + speechDbAboveNoise;
@@ -198,6 +205,16 @@ class AudioVad {
   double get noiseFloorDb => _noiseFloorDb;
   bool get inSpeech => _inSpeech;
   bool get endpointArmed => _endpointArmed;
+
+  /// Timestamp (ms) of the last frame that crossed the speech threshold.
+  /// Returns 0 if voice has not been detected yet in the current session.
+  int get lastVoiceMs => _lastVoiceMs;
+
+  /// Timestamp (ms) of the most recently processed frame.
+  int get lastFrameMs => _lastFrameMs;
+
+  /// dBFS value of the most recently processed frame (for UI/debug logging).
+  double get lastFrameDb => _lastFrameDb;
 
   // --- Utilities ---
 

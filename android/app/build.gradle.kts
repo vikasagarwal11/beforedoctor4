@@ -5,6 +5,14 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// Only apply Google Services if the config file exists.
+// This keeps builds working for contributors who don't have firebase config yet.
+if (file("google-services.json").exists()) {
+    apply(plugin = "com.google.gms.google-services")
+} else {
+    println("⚠️  google-services.json not found in android/app; skipping com.google.gms.google-services")
+}
+
 android {
     namespace = "com.example.pv_reporting"
     compileSdk = flutter.compileSdkVersion

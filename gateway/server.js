@@ -2,15 +2,18 @@
 // Production-grade: WebSocket server that bridges Flutter app to Vertex AI
 // Uses OAuth2 bearer tokens, structured logging (no PHI), audit trails
 
-import { WebSocketServer } from 'ws';
 import { randomUUID } from 'crypto';
-import { config } from './config.js';
+import { WebSocketServer } from 'ws';
 import { initializeFirebase, verifyFirebaseToken } from './auth.js';
-import { VertexLiveWSSession } from './vertex-live-ws-client.js';
+import { config } from './config.js';
 import { GatewayEventHandler } from './event-handler.js';
+import { logger } from './logger.js';
 import { SafetyGuardrail } from './safety-guardrail.js';
 import { GoogleStreamingASR } from './stt_streamer.js';
-import { logger } from './logger.js';
+import { VertexLiveWSSession } from './vertex-live-ws-client.js';
+
+const GATEWAY_PROTOCOL_VERSION = '1.1';
+const GATEWAY_STARTED_AT = new Date().toISOString();
 
 // Initialize Firebase and start server
 (async () => {
@@ -35,6 +38,7 @@ import { logger } from './logger.js';
   // Create WebSocket server
   const wss = new WebSocketServer({
     port: config.server.port,
+    host: '0.0.0.0', // Listen on all interfaces (required for Android emulator to reach 10.0.2.2)
     perMessageDeflate: false, // Disable compression for low latency
   });
 
@@ -64,6 +68,10 @@ import { logger } from './logger.js';
     let stt = null;
     let sttFallbackEnabled = config.stt.enabled;
     let sttUsingFallback = config.stt.enabled;
+
+    // Audio ingress stats (helps diagnose "listening but no transcripts")
+    let audioInFrames = 0;
+    let audioInBytes = 0;
     
     // Track first model audio chunk per turn (used for latency KPI)
     let firstAudioInTurn = true;
@@ -116,6 +124,17 @@ import { logger } from './logger.js';
       }
     };
 
+    // Emit a build/version handshake immediately so clients can confirm
+    // they are connected to the expected gateway deployment.
+    sendEvent('server.gateway.info', {
+      protocol_version: GATEWAY_PROTOCOL_VERSION,
+      build_id: config.server.buildId,
+      node_env: config.server.nodeEnv,
+      started_at: GATEWAY_STARTED_AT,
+      vertex_model: config.vertexAI.model,
+      stt_fallback_enabled: config.stt.enabled,
+    });
+
     // Track last sent state to avoid spam
     let lastSentState = null;
     
@@ -130,12 +149,20 @@ import { logger } from './logger.js';
     // Handle incoming messages (both JSON and binary)
     ws.on('message', async (data, isBinary) => {
       try {
-        // =========================================================
-        // 1) BINARY FRAMES: raw PCM16k s16le mono audio frames
-        // =========================================================
-        if (isBinary) {
+        const asBuffer =
+          Buffer.isBuffer(data)
+            ? data
+            : data instanceof ArrayBuffer
+              ? Buffer.from(data)
+              : ArrayBuffer.isView(data)
+                ? Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+                : null;
+
+        const canAcceptAudio = () => !!(vertexSession && authenticated && vertexReady);
+
+        const handleBinaryAudio = async (pcmBuffer) => {
           // CRITICAL: Reject audio until Vertex setup is complete
-          if (!vertexSession || !authenticated || !vertexReady) {
+          if (!canAcceptAudio()) {
             logger.warn('gateway.binary_audio_rejected', {
               session_id: sessionId,
               reason: !vertexSession ? 'session_not_initialized' 
@@ -145,8 +172,19 @@ import { logger } from './logger.js';
             return;
           }
 
-          const pcmBuffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-          if (pcmBuffer.length < 2) return;
+          if (!pcmBuffer || pcmBuffer.length < 2) return;
+
+          audioInFrames++;
+          audioInBytes += pcmBuffer.length;
+          if (audioInFrames % 50 === 0) {
+            logger.info('gateway.audio_ingress', {
+              session_id: sessionId,
+              user_id: userId,
+              frames: audioInFrames,
+              bytes: audioInBytes,
+              avg_bytes_per_frame: Math.round(audioInBytes / audioInFrames),
+            });
+          }
 
           // Forward to Vertex
           await vertexSession.sendAudio(pcmBuffer);
@@ -161,14 +199,95 @@ import { logger } from './logger.js';
           }
 
           sendStateEvent('listening');
+        };
+
+        // =========================================================
+        // 1) BINARY FRAMES: raw PCM16k s16le mono audio frames
+        // =========================================================
+        if (isBinary === true) {
+          await handleBinaryAudio(asBuffer ?? Buffer.from(data));
           return;
         }
 
         // =========================================================
         // 2) TEXT FRAMES: JSON protocol messages
         // =========================================================
-        const text = Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
-        const message = JSON.parse(text);
+        // NOTE: if `ws` (or proxies) deliver a Buffer here with isBinary=false,
+        // never try to JSON.parse raw PCM; treat it as binary audio instead.
+        if (typeof data !== 'string') {
+          if (asBuffer == null) {
+            logger.warn('gateway.unknown_frame_type', {
+              session_id: sessionId,
+              data_type: typeof data,
+            });
+            return;
+          }
+
+          // If the client accidentally sent JSON as bytes, it will still parse.
+          // If parsing fails, fall back to binary audio (no server.error spam).
+          const textCandidate = asBuffer.toString('utf8');
+          try {
+            const parsed = JSON.parse(textCandidate);
+            // If it parses, proceed as a normal JSON message.
+            data = JSON.stringify(parsed);
+          } catch (_) {
+            await handleBinaryAudio(asBuffer);
+            return;
+          }
+        }
+
+        const text = data;
+
+        let message;
+        try {
+          message = JSON.parse(text);
+        } catch (parseError) {
+          // Robust fallback: some clients mistakenly send raw base64 audio as a plain string.
+          // If it looks like base64 PCM, accept it without spamming server.error.
+          const looksLikeBase64 = (s) => {
+            if (typeof s !== 'string') return false;
+            const trimmed = s.trim();
+            if (trimmed.length < 64) return false;
+            if (trimmed.length % 4 !== 0) return false;
+            if (!/^[A-Za-z0-9+/=\r\n]+$/.test(trimmed)) return false;
+            return true;
+          };
+
+          if (looksLikeBase64(text)) {
+            if (canAcceptAudio()) {
+              try {
+                const pcmBuffer = Buffer.from(text.trim(), 'base64');
+                await handleBinaryAudio(pcmBuffer);
+              } catch (e) {
+                logger.warn('gateway.base64_audio_decode_failed', {
+                  session_id: sessionId,
+                  error: e?.message || String(e),
+                });
+              }
+            } else {
+              logger.warn('gateway.base64_audio_received_before_ready', {
+                session_id: sessionId,
+                reason: !vertexSession
+                  ? 'session_not_initialized'
+                  : !authenticated
+                    ? 'not_authenticated'
+                    : 'vertex_not_ready',
+              });
+            }
+            return;
+          }
+
+          logger.warn('gateway.json_parse_failed', {
+            session_id: sessionId,
+            is_binary: !!isBinary,
+            text_preview: text.slice(0, 120),
+            error_message: parseError.message,
+          });
+
+          // Do NOT surface this to the client: some proxies/misconfigurations deliver
+          // binary audio as text. Dropping softly prevents hard session failures.
+          return;
+        }
         
         logger.gateway('event_received', { session_id: sessionId, type: message?.type });
         
@@ -216,46 +335,69 @@ import { logger } from './logger.js';
               });
 
               // Initialize Vertex Live WebSocket session
-              vertexSession = new VertexLiveWSSession(sessionConfig);
-              await vertexSession.initialize();
+              try {
+                vertexSession = new VertexLiveWSSession(sessionConfig);
+                await vertexSession.initialize();
 
-              // CRITICAL: Register setup handler BEFORE startSession()
-              // Otherwise the setup event fires before this handler is registered
-              vertexSession.on('setup', () => {
-                // CRITICAL: Set flag to allow audio processing
-                vertexReady = true;
-                
-                logger.session('vertex_setup_complete', sessionId, userId, {
-                  vertex_ready: true,
+                // CRITICAL: Register setup handler BEFORE startSession()
+                // Otherwise the setup event fires before this handler is registered
+                vertexSession.on('setup', () => {
+                  // CRITICAL: Set flag to allow audio processing
+                  vertexReady = true;
+                  
+                  logger.session('vertex_setup_complete', sessionId, userId, {
+                    vertex_ready: true,
+                  });
+                  
+                  // NOW it's safe to tell Flutter we're ready and listening
+                  sendStateEvent('ready');
+                  sendStateEvent('listening');
+                  
+                  logger.session('session_ready', sessionId, userId, {
+                    audio_accepted: true,
+                  });
+                });
+
+                // Send initial connecting state (before startSession for UX responsiveness)
+                sendStateEvent('connecting');
+
+                // Start session (waits for setupComplete internally)
+                await vertexSession.startSession();
+
+                // Safety net: if setup already completed before handler fired
+                if (vertexSession.isSetup === true && vertexReady !== true) {
+                  vertexReady = true;
+                  sendStateEvent('ready');
+                  sendStateEvent('listening');
+                  logger.session('session_ready_safety_net', sessionId, userId, {
+                    audio_accepted: true,
+                  });
+                }
+              } catch (vertexError) {
+                logger.error('vertex.session_initialization_failed', {
+                  session_id: sessionId,
+                  user_id: userId,
+                  error_message: vertexError.message,
+                  error_code: vertexError.code,
                 });
                 
-                // NOW it's safe to tell Flutter we're ready and listening
-                sendStateEvent('ready');
-                sendStateEvent('listening');
+                sendEvent('server.error', {
+                  message: `Vertex AI initialization failed: ${vertexError.message}`,
+                  code: 'VERTEX_INIT_FAILED',
+                });
                 
-                logger.session('session_ready', sessionId, userId, {
-                  audio_accepted: true,
-                });
-              });
-
-              // Send initial connecting state (before startSession for UX responsiveness)
-              sendStateEvent('connecting');
-
-              // Start session (waits for setupComplete internally)
-              await vertexSession.startSession();
-
-              // Safety net: if setup already completed before handler fired
-              if (vertexSession.isSetup === true && vertexReady !== true) {
-                vertexReady = true;
-                sendStateEvent('ready');
-                sendStateEvent('listening');
-                logger.session('session_ready_safety_net', sessionId, userId, {
-                  audio_accepted: true,
-                });
+                // Clean up and close connection
+                ws.close(4000, 'Vertex initialization failed');
+                return;
               }
 
               // Set up event handlers
-              eventHandler = new GatewayEventHandler(sendEvent);
+              // IMPORTANT: keep sequence numbers monotonic across pre-session and post-session
+              // to avoid client-side out-of-order drops.
+              eventHandler = new GatewayEventHandler(
+                sendEvent,
+                Math.max(0, tempSeq - 1)
+              );
               
               // Initialize safety guardrail
               const safetyGuardrail = new SafetyGuardrail();
@@ -347,6 +489,36 @@ import { logger } from './logger.js';
                       }
                     }
                     eventHandler.handleUserTranscript(sttData);
+                  }, (sttError) => {
+                    // Surface a clear actionable error to the client and avoid silent "listening".
+                    const msg = sttError?.message || String(sttError);
+                    const code = sttError?.code;
+
+                    // If Speech API is disabled/not enabled, retries won't help.
+                    const looksDisabled =
+                      code === 7 &&
+                      typeof msg === 'string' &&
+                      (msg.includes('speech.googleapis.com') || msg.toLowerCase().includes('api has not been used'));
+
+                    if (looksDisabled) {
+                      sendEvent('server.error', {
+                        code: 'STT_API_DISABLED',
+                        message:
+                          'Speech-to-Text API is disabled for the Google Cloud project of your service account. Enable `speech.googleapis.com` in GCP, then restart the gateway.',
+                      });
+
+                      logger.session('stt_fallback_disabled', sessionId, userId, {
+                        reason: 'speech_api_disabled',
+                        error_code: code,
+                      });
+
+                      sttFallbackEnabled = false;
+                      sttUsingFallback = false;
+                      try {
+                        stt?.stop();
+                      } catch (_) {}
+                      stt = null;
+                    }
                   });
                   metrics.transcriptSource = 'stt'; // Initial state
                   logger.session('stt_fallback_started', sessionId, userId, {

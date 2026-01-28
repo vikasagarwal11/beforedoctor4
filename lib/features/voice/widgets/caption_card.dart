@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
-import '../screens/voice_screen.dart';
+
 import '../../../core/constants/tokens.dart';
+import '../voice_session_controller_v2.dart';
 import 'waveform_bars.dart';
 
 class CaptionCard extends StatelessWidget {
@@ -29,9 +30,13 @@ class CaptionCard extends StatelessWidget {
       switchInCurve: Curves.easeOutCubic,
       switchOutCurve: Curves.easeInCubic,
       transitionBuilder: (child, anim) {
-        final offset = Tween<Offset>(begin: const Offset(0, 0.06), end: Offset.zero).animate(anim);
+        final offset =
+            Tween<Offset>(begin: const Offset(0, 0.06), end: Offset.zero)
+                .animate(anim);
         final fade = Tween<double>(begin: 0, end: 1).animate(anim);
-        return FadeTransition(opacity: fade, child: SlideTransition(position: offset, child: child));
+        return FadeTransition(
+            opacity: fade,
+            child: SlideTransition(position: offset, child: child));
       },
       child: KeyedSubtree(
         key: ValueKey<String>(caption),
@@ -48,7 +53,8 @@ class CaptionCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Live caption', style: t.titleSmall?.copyWith(color: c.onSurfaceVariant)),
+            Text('Live caption',
+                style: t.titleSmall?.copyWith(color: c.onSurfaceVariant)),
             const SizedBox(height: AppTokens.sm),
             captionWidget,
             const SizedBox(height: AppTokens.md),
@@ -65,4 +71,3 @@ class CaptionCard extends StatelessWidget {
     );
   }
 }
-

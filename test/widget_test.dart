@@ -5,26 +5,25 @@
 // gestures. You can also use WidgetTester to find child widgets in the widget
 // tree, read text, and verify that the values of widget properties are correct.
 
-import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-
+import 'package:pv_reporting/data/repositories/mock_repo.dart';
 import 'package:pv_reporting/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  testWidgets('App boots and shows navigation', (WidgetTester tester) async {
+    await tester.pumpWidget(
+      ProviderScope(
+        child: MyApp(repo: MockRepo.bootstrap()),
+      ),
+    );
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    // Let initial build complete (avoid pumpAndSettle due to repeating animations).
+    await tester.pump(const Duration(milliseconds: 50));
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
-
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    // Bottom navigation labels from AppShell.
+    expect(find.text('Timeline'), findsOneWidget);
+    expect(find.text('Voice'), findsOneWidget);
+    expect(find.text('Library'), findsOneWidget);
   });
 }
