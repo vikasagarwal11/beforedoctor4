@@ -11,6 +11,7 @@
 import 'dart:convert';
 
 enum GatewayEventType {
+<<<<<<< HEAD
   gatewayInfo, // server.gateway.info
   kpi, // server.kpi
   sessionState, // server.session.state
@@ -24,6 +25,20 @@ enum GatewayEventType {
   audioStop, // server.audio.stop       (barge-in / flush playback)
   emergency, // server.triage.emergency
   error, // server.error
+=======
+  sessionState,            // server.session.state
+  userTranscriptPartial,   // server.user.transcript.partial
+  userTranscriptFinal,     // server.user.transcript.final
+  transcriptPartial,       // server.transcript.partial
+  transcriptFinal,         // server.transcript.final
+  narrativeUpdate,         // server.narrative.update  (string or patch)
+  aeDraftUpdate,           // server.ae_draft.update   (json patch)
+  audioOut,                // server.audio.out        (base64 pcm24k s16le)
+  audioStop,               // server.audio.stop       (barge-in / flush playback)
+  emergency,               // server.triage.emergency
+  error,                   // server.error
+  unknown,                 // unrecognized event types (logged but ignored)
+>>>>>>> 9355153449b734b1f5ac71afb47356d723984193
 }
 
 /// Canonical envelope: { type: string, payload: object, seq?: int }
@@ -38,11 +53,23 @@ class GatewayEvent {
   static GatewayEvent fromJson(Map<String, dynamic> json) {
     final t = json['type'] as String? ?? '';
     final seq = (json['seq'] is num) ? (json['seq'] as num).toInt() : 0;
+    final eventType = _mapType(t);
+
+    // Store original type string in payload for debugging unknown events
+    final payload = (json['payload'] as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
+    if (eventType == GatewayEventType.unknown || eventType == GatewayEventType.error) {
+      payload['_original_type'] = t;
+    }
 
     return GatewayEvent(
+<<<<<<< HEAD
       type: _mapType(t),
       payload: (json['payload'] as Map?)?.cast<String, dynamic>() ??
           const <String, dynamic>{},
+=======
+      type: eventType,
+      payload: payload,
+>>>>>>> 9355153449b734b1f5ac71afb47356d723984193
       seq: seq,
     );
   }
@@ -74,8 +101,10 @@ class GatewayEvent {
       case 'server.triage.emergency':
         return GatewayEventType.emergency;
       case 'server.error':
-      default:
         return GatewayEventType.error;
+      default:
+        // Unknown event types should be logged but not treated as errors
+        return GatewayEventType.unknown;
     }
   }
 }

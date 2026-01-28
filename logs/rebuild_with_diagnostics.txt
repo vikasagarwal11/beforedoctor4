@@ -1,0 +1,45 @@
+Resolving dependencies...
+Downloading packages...
+  _fe_analyzer_shared 85.0.0 (93.0.0 available)
+  analyzer 7.7.1 (10.0.1 available)
+  audio_session 0.1.25 (0.2.2 available)
+  characters 1.4.0 (1.4.1 available)
+  flutter_lints 3.0.2 (6.0.0 available)
+  flutter_pcm_sound 1.2.7 (3.3.3 available)
+  flutter_riverpod 3.1.0 (3.2.0 available)
+  flutter_sound_platform_interface 9.30.0 (10.3.8 available)
+  flutter_sound_web 9.30.0 (10.3.8 available)
+  hooks_riverpod 3.1.0 (3.2.0 available)
+  lints 3.0.0 (6.0.0 available)
+  matcher 0.12.17 (0.12.18 available)
+  material_color_utilities 0.11.1 (0.13.0 available)
+  meta 1.17.0 (1.18.0 available)
+  path_provider_android 2.2.19 (2.2.22 available)
+  path_provider_foundation 2.4.2 (2.6.0 available)
+  permission_handler 11.4.0 (12.0.1 available)
+  permission_handler_android 12.1.0 (13.0.1 available)
+  riverpod 3.1.0 (3.2.0 available)
+  test 1.26.3 (1.29.0 available)
+  test_api 0.7.7 (0.7.9 available)
+  test_core 0.6.12 (0.6.15 available)
+  vm_service 15.0.0 (15.0.2 available)
+Got dependencies!
+23 packages have newer versions incompatible with dependency constraints.
+Try `flutter pub outdated` for more information.
+Launching lib/main.dart on Vikas iPhone 15P (wireless) in debug mode...
+Wireless debugging on iOS 26 may be slower than expected. For better performance, consider using a wired (USB) connection.
+Automatically signing iOS for device deployment using specified development team in Xcode project: U3RD58627Q
+Running pod install...                                              3.8s
+Running Xcode build...                                          
+Xcode build done.                                           63.4s
+Failed to build iOS app
+Could not build the precompiled application for the device.
+Uncategorized (Xcode): Timed out waiting for all destinations matching the provided destination specifier to become available
+
+
+	Available destinations for the "Runner" scheme:
+		{ platform:iOS, arch:arm64, id:00008130-001C45D22ED0001C, name:Vikas iPhone 15P, error:Browsing on the local area network for Vikas iPhone 15P, which has previously reported preparation errors Ensure the device is unlocked and attached with a cable or associated with the same local area network as this Mac.
+The device must be opted into Developer Mode to connect wirelessly. }
+
+
+Error launching application on Vikas iPhone 15P (wireless).

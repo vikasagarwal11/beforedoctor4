@@ -1,74 +1,130 @@
 #!/bin/bash
-# Aggressive fix for codesign errors
-# Removes ALL extended attributes that block codesigning
+# Comprehensive code signing fix script
+# Handles extended attributes, build cleanup, and dependency reinstallation
+# Usage: ./scripts/fix_codesign.sh [--aggressive] [--run]
 
-echo "🔧 Aggressive Codesign Fix"
-echo "=========================="
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$PROJECT_DIR"
+
+AGGRESSIVE=false
+RUN_AFTER=false
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --aggressive)
+            AGGRESSIVE=true
+            shift
+            ;;
+        --run)
+            RUN_AFTER=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--aggressive] [--run]"
+            exit 1
+            ;;
+    esac
+done
+
+echo "🔧 Code Signing Fix"
+echo "==================="
 echo ""
 
-cd /Users/ainarai/Desktop/Vikas/beforedoctor4/beforedoctor4
-
-echo "This will:"
-echo "  1. Remove ALL build artifacts"
-echo "  2. Remove extended attributes (may need sudo password)"
-echo "  3. Clean Flutter cache"
-echo "  4. Reinstall dependencies"
-echo ""
-read -p "Continue? (y/n): " -n 1 -r
-echo ""
-
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Cancelled."
-    exit 0
+if [ "$AGGRESSIVE" = true ]; then
+    echo "⚠️  AGGRESSIVE MODE: Will remove ALL build artifacts"
+    echo ""
+    read -p "Continue? (y/n): " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Cancelled."
+        exit 0
+    fi
 fi
 
+# Step 1: Clean extended attributes
+echo "1️⃣  Removing extended attributes..."
+find . -name "*.framework" -exec xattr -cr {} \; 2>/dev/null || true
+xattr -cr ios 2>/dev/null || true
+xattr -cr build 2>/dev/null || true
+if [ "$AGGRESSIVE" = true ]; then
+    echo "   Removing ALL extended attributes (may ask for sudo password)..."
+    sudo xattr -cr . 2>/dev/null || xattr -cr . 2>/dev/null || true
+fi
+echo "   ✅ Extended attributes removed"
 echo ""
-echo "1️⃣  Removing build directories..."
-rm -rf build/
-rm -rf ios/build/
-rm -rf ios/.symlinks/
-rm -rf ios/Flutter/
-rm -rf .dart_tool/
-rm -rf .flutter-plugins
-rm -rf .flutter-plugins-dependencies
-echo "   ✅ Done"
 
+# Step 2: Clean Flutter build
+echo "2️⃣  Cleaning Flutter build..."
+flutter clean > /dev/null 2>&1
+echo "   ✅ Flutter cleaned"
 echo ""
-echo "2️⃣  Removing extended attributes (may ask for sudo password)..."
-echo "   Cleaning project root..."
-sudo xattr -cr . 2>/dev/null || xattr -cr . 2>/dev/null || true
-echo "   ✅ Done"
 
+# Step 3: Clear Xcode cache
+echo "3️⃣  Clearing Xcode cache..."
+rm -rf ~/Library/Developer/Xcode/DerivedData/Runner-* 2>/dev/null || true
+echo "   ✅ Xcode cache cleared"
 echo ""
-echo "3️⃣  Running flutter clean..."
-flutter clean
-echo "   ✅ Done"
 
-echo ""
-echo "4️⃣  Removing Pods..."
+# Step 4: Aggressive cleanup (if requested)
+if [ "$AGGRESSIVE" = true ]; then
+    echo "4️⃣  Removing ALL build artifacts..."
+    rm -rf build/ ios/build/ ios/.symlinks/ ios/Flutter/ .dart_tool/
+    rm -rf .flutter-plugins .flutter-plugins-dependencies
+    echo "   ✅ Build artifacts removed"
+    echo ""
+fi
+
+# Step 5: Reinstall CocoaPods
+echo "5️⃣  Reinstalling CocoaPods..."
 cd ios
-rm -rf Pods/
-rm -rf Podfile.lock
+if [ "$AGGRESSIVE" = true ]; then
+    rm -rf Pods/ Podfile.lock
+    pod deintegrate > /dev/null 2>&1 || true
+fi
+pod install > /dev/null 2>&1
 cd ..
-echo "   ✅ Done"
-
+echo "   ✅ CocoaPods reinstalled"
 echo ""
-echo "5️⃣  Running flutter pub get..."
-flutter pub get
-echo "   ✅ Done"
 
-echo ""
-echo "6️⃣  Reinstalling CocoaPods..."
-cd ios
-pod install --repo-update
-cd ..
-echo "   ✅ Done"
+# Step 6: Get Flutter dependencies
+if [ "$AGGRESSIVE" = true ]; then
+    echo "6️⃣  Getting Flutter dependencies..."
+    flutter pub get > /dev/null 2>&1
+    echo "   ✅ Dependencies installed"
+    echo ""
+fi
 
-echo ""
+# Step 7: Check gateway (if --run is specified)
+if [ "$RUN_AFTER" = true ]; then
+    echo "7️⃣  Checking gateway..."
+    if pgrep -f "node server.js" > /dev/null; then
+        GATEWAY_PID=$(pgrep -f "node server.js")
+        echo "   ✅ Gateway running (PID: $GATEWAY_PID)"
+    else
+        echo "   ⚠️  Gateway not running - starting..."
+        "$PROJECT_DIR/START_GATEWAY.sh" || true
+    fi
+    echo ""
+fi
+
 echo "════════════════════════════════════════"
-echo "✅ Aggressive cleanup complete!"
+echo "✅ Code signing fix complete!"
 echo "════════════════════════════════════════"
 echo ""
-echo "Now run: flutter run"
-echo "Or run: ./scripts/execute_script.sh"
+
+if [ "$RUN_AFTER" = true ]; then
+    echo "🚀 Running app..."
+    flutter run -d 00008130-001C45D22ED0001C || flutter run
+else
+    echo "Next steps:"
+    echo "  • Run: flutter run"
+    echo "  • Or: ./scripts/execute_script.sh"
+    echo "  • Or: Open Xcode and build there"
+fi
 echo ""
