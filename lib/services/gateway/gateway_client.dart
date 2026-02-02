@@ -21,14 +21,17 @@ abstract class IGatewayClient {
 
   Future<void> connect({
     required Uri url,
-    required String firebaseIdToken,
+    required String
+        firebaseIdToken, // Keep parameter name for backward compatibility
     required Map<String, dynamic> sessionConfig,
+    String? conversationId, // Optional conversation ID for persistence
   });
 
   Future<void> sendAudioChunkBase64(String base64Pcm16k);
   Future<void> sendAudioChunkBinary(
       Uint8List pcm16k); // Binary WebSocket frames
   Future<void> sendTurnComplete();
+  Future<void> sendTextTurn(String text, {String? conversationId});
   Future<void> sendBargeIn(); // Cancel server-side audio generation
   Future<void> sendStop();
   Future<void> close();
@@ -50,8 +53,10 @@ class GatewayClient implements IGatewayClient {
   @override
   Future<void> connect({
     required Uri url,
-    required String firebaseIdToken,
+    required String
+        firebaseIdToken, // Renamed from Firebase to Supabase, but keeping param name
     required Map<String, dynamic> sessionConfig,
+    String? conversationId, // Optional conversation ID for persistence
   }) async {
     await close();
 
@@ -113,6 +118,7 @@ class GatewayClient implements IGatewayClient {
     _channel!.sink.add(clientHello(
       firebaseIdToken: firebaseIdToken,
       sessionConfig: sessionConfig,
+      conversationId: conversationId,
     ));
   }
 
@@ -139,6 +145,15 @@ class GatewayClient implements IGatewayClient {
       throw StateError('Gateway not connected');
     }
     _channel!.sink.add(clientTurnComplete());
+  }
+
+  @override
+  Future<void> sendTextTurn(String text, {String? conversationId}) async {
+    if (_channel == null || !_connected) {
+      throw StateError('Gateway not connected');
+    }
+    _channel!.sink
+        .add(clientTextTurn(text: text, conversationId: conversationId));
   }
 
   @override

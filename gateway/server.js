@@ -4,20 +4,27 @@
 
 import { randomUUID } from 'crypto';
 import { WebSocketServer } from 'ws';
-import { initializeFirebase, verifyFirebaseToken } from './auth.js';
 import { config } from './config.js';
 import { GatewayEventHandler } from './event-handler.js';
 import { logger } from './logger.js';
 import { SafetyGuardrail } from './safety-guardrail.js';
 import { GoogleStreamingASR } from './stt_streamer.js';
-import { VertexLiveWSSession } from './vertex-live-ws-client.js';
+import { getSupabaseAdmin, initializeSupabase, verifySupabaseToken } from './supabase-auth.js';
+import { SupabaseMessagePersistence } from './supabase-persistence.js';
+import { VertexAISession } from './vertex-ai-client.js';
 
 const GATEWAY_PROTOCOL_VERSION = '1.1';
 const GATEWAY_STARTED_AT = new Date().toISOString();
 
-// Initialize Firebase and start server
+// IMPORTANT:
+// The Flutter app already persists chat messages to Supabase.
+// If the gateway also persists, the UI will show duplicates (and user ASR will appear in chat
+// even before pressing Send). Keep gateway persistence OFF by default.
+const GATEWAY_PERSIST_MESSAGES = process.env.GATEWAY_PERSIST_MESSAGES === 'true';
+
+// Initialize Supabase and start server
 (async () => {
-  await initializeFirebase();
+  await initializeSupabase();
 
   // Validate Speech-to-Text API if STT fallback is enabled
   if (config.stt.enabled) {
@@ -47,6 +54,7 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
     environment: config.server.nodeEnv,
     project: config.vertexAI.projectId,
     location: config.vertexAI.location,
+    persist_messages: GATEWAY_PERSIST_MESSAGES,
   });
 
   wss.on('connection', (ws, req) => {
@@ -60,18 +68,33 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
     });
     
     let vertexSession = null;
+    let agentSession = null;
     let eventHandler = null;
     let userId = null;
     let sessionConfig = null;
     let authenticated = false;
-    let vertexReady = false; // CRITICAL: Only accept audio after Vertex setup complete
+    // Legacy flag from the former Vertex Live path. Live is disabled; keep for minimal diff.
+    let vertexReady = false;
+    let agentReady = false;
+    // REST-only: disable Live regardless of env/config.
+    let vertexDisabled = true;
+    logger.info('vertex.live_disabled', {
+      agent_model: config.vertexAI.agentModel,
+    });
+    let vertexConnecting = false;
+    let lastVertexStartAttemptAt = 0;
     let stt = null;
     let sttFallbackEnabled = config.stt.enabled;
     let sttUsingFallback = config.stt.enabled;
+    
+    // Persistence: Initialize persistence module and track conversation
+    let persistence = null;
+    let currentConversationId = null;
 
     // Audio ingress stats (helps diagnose "listening but no transcripts")
     let audioInFrames = 0;
     let audioInBytes = 0;
+    let lastAudioNotReadyAt = 0;
     
     // Track first model audio chunk per turn (used for latency KPI)
     let firstAudioInTurn = true;
@@ -131,7 +154,8 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
       build_id: config.server.buildId,
       node_env: config.server.nodeEnv,
       started_at: GATEWAY_STARTED_AT,
-      vertex_model: config.vertexAI.model,
+      agent_model: config.vertexAI.agentModel,
+      assistant_language: process.env.ASSISTANT_LANGUAGE || 'English',
       stt_fallback_enabled: config.stt.enabled,
     });
 
@@ -146,6 +170,9 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
       }
     };
 
+    // REST-only: no Vertex Live sessions.
+    const ensureVertexSessionReady = async () => false;
+
     // Handle incoming messages (both JSON and binary)
     ws.on('message', async (data, isBinary) => {
       try {
@@ -158,21 +185,19 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
                 ? Buffer.from(data.buffer, data.byteOffset, data.byteLength)
                 : null;
 
-        const canAcceptAudio = () => !!(vertexSession && authenticated && vertexReady);
+        const canAcceptAudio = () => !!(authenticated && sttFallbackEnabled && sttUsingFallback && stt);
 
         const handleBinaryAudio = async (pcmBuffer) => {
-          // CRITICAL: Reject audio until Vertex setup is complete
-          if (!canAcceptAudio()) {
-            logger.warn('gateway.binary_audio_rejected', {
-              session_id: sessionId,
-              reason: !vertexSession ? 'session_not_initialized' 
-                    : !authenticated ? 'not_authenticated'
-                    : 'vertex_not_ready',
-            });
-            return;
-          }
-
           if (!pcmBuffer || pcmBuffer.length < 2) return;
+
+          // REST-only: ignore audio before auth/session init or if STT isn't running.
+          if (!canAcceptAudio()) return;
+
+          // Ensure PCM16 frames are even length
+          if (pcmBuffer.length % 2 !== 0) {
+            pcmBuffer = pcmBuffer.subarray(0, pcmBuffer.length - 1);
+            if (pcmBuffer.length < 2) return;
+          }
 
           audioInFrames++;
           audioInBytes += pcmBuffer.length;
@@ -186,16 +211,10 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
             });
           }
 
-          // Forward to Vertex
-          await vertexSession.sendAudio(pcmBuffer);
-
-          // Optional: feed fallback STT from the same PCM buffer
-          if (sttFallbackEnabled && sttUsingFallback && stt) {
-            try {
-              stt.write(pcmBuffer);
-            } catch (e) {
-              logger.warn('stt.fallback_write_failed', { session_id: sessionId, error: String(e) });
-            }
+          try {
+            stt.write(pcmBuffer);
+          } catch (e) {
+            logger.warn('stt.fallback_write_failed', { session_id: sessionId, error: String(e) });
           }
 
           sendStateEvent('listening');
@@ -267,11 +286,13 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
             } else {
               logger.warn('gateway.base64_audio_received_before_ready', {
                 session_id: sessionId,
-                reason: !vertexSession
-                  ? 'session_not_initialized'
-                  : !authenticated
-                    ? 'not_authenticated'
-                    : 'vertex_not_ready',
+                reason: !authenticated
+                  ? 'not_authenticated'
+                  : !sttFallbackEnabled
+                    ? 'stt_disabled'
+                    : !stt
+                      ? 'stt_not_started'
+                      : 'not_ready',
               });
             }
             return;
@@ -291,13 +312,22 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
         
         logger.gateway('event_received', { session_id: sessionId, type: message?.type });
         
+        // Track conversation ID from any client message if provided
+        if (message?.payload?.conversation_id && !currentConversationId) {
+          currentConversationId = message.payload.conversation_id;
+          logger.session('conversation_tracked_from_message', sessionId, userId, {
+            conversationId: currentConversationId,
+            messageType: message.type,
+          });
+        }
+        
         // ---------------------------------------------------------
         // GATE JSON AUDIO MESSAGES ON vertexReady TOO (IMPORTANT)
         // ---------------------------------------------------------
-        if (
+        if (!vertexDisabled && (
           message?.type === 'client.audio.chunk' ||
           message?.type === 'client.audio.chunk.base64'
-        ) {
+        )) {
           if (!vertexSession || !authenticated || !vertexReady) {
             logger.warn('gateway.audio_chunk_rejected', {
               session_id: sessionId,
@@ -317,78 +347,141 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
               // Diagnostic logging: Check what we received
               logger.info('gateway.client_hello_received', {
                 has_payload: !!message.payload,
-                has_token: !!(message.payload?.firebase_id_token),
-                token_length: message.payload?.firebase_id_token?.length || 0,
+                has_token: !!(message.payload?.supabase_access_token),
+                token_length: message.payload?.supabase_access_token?.length || 0,
                 has_session_config: !!(message.payload?.session_config),
               });
               
-              // Verify Firebase token
-              const tokenData = await verifyFirebaseToken(
-                message.payload.firebase_id_token
+              // Verify Supabase token
+              const tokenData = await verifySupabaseToken(
+                message.payload.supabase_access_token
               );
               userId = tokenData.uid;
               sessionConfig = message.payload.session_config;
               authenticated = true;
+              
+              // Initialize persistence module with Supabase admin client (optional)
+              if (GATEWAY_PERSIST_MESSAGES) {
+                try {
+                  const supabase = getSupabaseAdmin();
+                  if (supabase) {
+                    persistence = new SupabaseMessagePersistence(supabase);
+                    logger.session('persistence_initialized', sessionId, userId, {});
+                  }
+                } catch (error) {
+                  logger.error('persistence_initialization_failed', {
+                    session_id: sessionId,
+                    error: error.message,
+                  });
+                }
+              } else {
+                logger.session('persistence_disabled', sessionId, userId, {
+                  reason: 'GATEWAY_PERSIST_MESSAGES is not true',
+                });
+              }
+              
+              // Track conversation ID from client if provided
+              if (message.payload.conversation_id) {
+                currentConversationId = message.payload.conversation_id;
+                logger.session('conversation_tracked', sessionId, userId, {
+                  conversationId: currentConversationId,
+                });
+              }
 
               logger.session('authenticated', sessionId, userId, {
                 has_session_config: !!sessionConfig,
               });
 
-              // Initialize Vertex Live WebSocket session
-              try {
-                vertexSession = new VertexLiveWSSession(sessionConfig);
-                await vertexSession.initialize();
+              // Vertex Live is intentionally disabled (REST-only).
+              if (false) {
+                // Initialize Vertex Live WebSocket session
+                try {
+                  vertexSession = new VertexLiveWSSession(sessionConfig);
+                  await vertexSession.initialize();
 
-                // CRITICAL: Register setup handler BEFORE startSession()
-                // Otherwise the setup event fires before this handler is registered
-                vertexSession.on('setup', () => {
-                  // CRITICAL: Set flag to allow audio processing
-                  vertexReady = true;
-                  
-                  logger.session('vertex_setup_complete', sessionId, userId, {
-                    vertex_ready: true,
+                  // CRITICAL: Register setup handler BEFORE startSession()
+                  // Otherwise the setup event fires before this handler is registered
+                  vertexSession.on('setup', () => {
+                    // CRITICAL: Set flag to allow audio processing
+                    vertexReady = true;
+                    
+                    logger.session('vertex_setup_complete', sessionId, userId, {
+                      vertex_ready: true,
+                    });
+                    
+                    // NOW it's safe to tell Flutter we're ready and listening
+                    sendStateEvent('ready');
+                    sendStateEvent('listening');
+                    
+                    logger.session('session_ready', sessionId, userId, {
+                      audio_accepted: true,
+                    });
+                  });
+
+                  // Send initial connecting state (before startSession for UX responsiveness)
+                  sendStateEvent('connecting');
+
+                  // Start session (waits for setupComplete internally)
+                  await vertexSession.startSession();
+
+                  // Safety net: if setup already completed before handler fired
+                  if (vertexSession.isSetup === true && vertexReady !== true) {
+                    vertexReady = true;
+                    sendStateEvent('ready');
+                    sendStateEvent('listening');
+                    logger.session('session_ready_safety_net', sessionId, userId, {
+                      audio_accepted: true,
+                    });
+                  }
+                } catch (vertexError) {
+                  logger.error('vertex.session_initialization_failed', {
+                    session_id: sessionId,
+                    user_id: userId,
+                    error_message: vertexError.message,
+                    error_code: vertexError.code,
                   });
                   
-                  // NOW it's safe to tell Flutter we're ready and listening
-                  sendStateEvent('ready');
-                  sendStateEvent('listening');
-                  
-                  logger.session('session_ready', sessionId, userId, {
-                    audio_accepted: true,
-                  });
-                });
+                  if (!vertexDisabled) {
+                    sendEvent('server.error', {
+                      message: `Vertex AI initialization failed: ${vertexError.message}`,
+                      code: 'VERTEX_INIT_FAILED',
+                    });
+                  } else {
+                    logger.warn('vertex.live_init_skipped', {
+                      session_id: sessionId,
+                      user_id: userId,
+                      reason: vertexError.message,
+                    });
+                  }
 
-                // Send initial connecting state (before startSession for UX responsiveness)
-                sendStateEvent('connecting');
-
-                // Start session (waits for setupComplete internally)
-                await vertexSession.startSession();
-
-                // Safety net: if setup already completed before handler fired
-                if (vertexSession.isSetup === true && vertexReady !== true) {
-                  vertexReady = true;
-                  sendStateEvent('ready');
-                  sendStateEvent('listening');
-                  logger.session('session_ready_safety_net', sessionId, userId, {
-                    audio_accepted: true,
-                  });
+                  // Degrade to REST agent + STT fallback; keep connection open
+                  vertexSession = null;
+                  vertexReady = false;
+                  vertexDisabled = true;
                 }
-              } catch (vertexError) {
-                logger.error('vertex.session_initialization_failed', {
+              }
+
+              // Initialize REST assistant session (text-only)
+              try {
+                agentSession = new VertexAISession(sessionConfig);
+                await agentSession.initialize();
+                await agentSession.startSession();
+                agentReady = true;
+                logger.session('agent_session_ready', sessionId, userId, {
+                  model: config.vertexAI.agentModel,
+                });
+                if (vertexDisabled) {
+                  sendStateEvent('ready');
+                  sendStateEvent('listening');
+                }
+              } catch (agentError) {
+                agentReady = false;
+                logger.error('agent.session_initialization_failed', {
                   session_id: sessionId,
                   user_id: userId,
-                  error_message: vertexError.message,
-                  error_code: vertexError.code,
+                  error_message: agentError.message,
+                  error_code: agentError.code,
                 });
-                
-                sendEvent('server.error', {
-                  message: `Vertex AI initialization failed: ${vertexError.message}`,
-                  code: 'VERTEX_INIT_FAILED',
-                });
-                
-                // Clean up and close connection
-                ws.close(4000, 'Vertex initialization failed');
-                return;
               }
 
               // Set up event handlers
@@ -402,11 +495,63 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
               // Initialize safety guardrail
               const safetyGuardrail = new SafetyGuardrail();
 
-              vertexSession.on('transcript', (data) => {
-                // Assistant transcript (model output)
-                eventHandler.handleTranscript(data);
-              });
+              // Track transcript state to ensure we send all responses
+              let lastAssistantText = '';
+              let lastAssistantPartial = '';
 
+              const handleAssistantTranscript = async (data, source) => {
+                logger.session('transcript_event_received', sessionId, userId, {
+                  source,
+                  text_length: data.text.length,
+                  is_partial: data.isPartial,
+                  text_preview: data.text.substring(0, 100),
+                });
+
+                eventHandler.handleTranscript(data);
+
+                if (data.isPartial) {
+                  lastAssistantPartial = data.text;
+                } else {
+                  lastAssistantText = data.text;
+                  lastAssistantPartial = '';
+                }
+
+                if (GATEWAY_PERSIST_MESSAGES && !data.isPartial && data.text && currentConversationId && persistence) {
+                  try {
+                    await persistence.saveAssistantMessage(
+                      currentConversationId,
+                      data.text,
+                      randomUUID()
+                    );
+                    logger.session('assistant_message_persisted', sessionId, userId, {
+                      responseLength: data.text.length,
+                      conversationId: currentConversationId,
+                      textPreview: data.text.substring(0, 100),
+                      source,
+                    });
+                  } catch (error) {
+                    logger.error('persist_assistant_message_failed', {
+                      error: error.message,
+                      sessionId,
+                      userId,
+                    });
+                  }
+                }
+              };
+
+              if (vertexSession) {
+                vertexSession.on('transcript', async (data) => {
+                  await handleAssistantTranscript(data, 'live');
+                });
+              }
+
+              if (agentSession) {
+                agentSession.on('transcript', async (data) => {
+                  await handleAssistantTranscript(data, 'rest');
+                });
+              }
+
+              if (vertexSession) {
               vertexSession.on('userTranscript', (data) => {
                 // If Vertex provides user transcripts, prefer it over fallback STT
                 if (sttUsingFallback) {
@@ -451,8 +596,54 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
                   }
                 }
 
+                // Optional: Save final user transcript to Supabase (disabled by default)
+                if (GATEWAY_PERSIST_MESSAGES && !data.isPartial && data.text && currentConversationId && persistence) {
+                  (async () => {
+                    try {
+                      await persistence.saveUserMessage(
+                        currentConversationId,
+                        data.text,
+                        randomUUID()
+                      );
+                      logger.session('user_message_persisted', sessionId, userId, {
+                        contentLength: data.text.length,
+                        conversationId: currentConversationId,
+                      });
+                    } catch (error) {
+                      logger.error('persist_user_message_failed', {
+                        error: error.message,
+                        sessionId,
+                        userId,
+                      });
+                    }
+                  })();
+                }
+
+                // REST-only UX: do NOT auto-send transcripts to the model.
+                // The client controls when to send via `client.text.turn`.
+
                 eventHandler.handleUserTranscript(data);
               });
+              }
+
+              if (vertexSession) {
+                vertexSession.on('closed', ({ code, reason }) => {
+                  vertexReady = false;
+                  logger.session('vertex_session_closed', sessionId, userId, {
+                    code,
+                    reason,
+                  });
+                  sendStateEvent('connecting');
+                });
+
+                vertexSession.on('error', (err) => {
+                  vertexReady = false;
+                  logger.session('vertex_session_error', sessionId, userId, {
+                    error_message: err?.message || String(err),
+                  });
+                  sendStateEvent('connecting');
+                });
+              }
 
               // Start fallback STT stream if enabled
               if (sttFallbackEnabled) {
@@ -488,6 +679,31 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
                         });
                       }
                     }
+                      // Optional: Save final user transcript to Supabase (STT fallback)
+                      if (GATEWAY_PERSIST_MESSAGES && !sttData.isPartial && sttData.text && currentConversationId && persistence) {
+                        (async () => {
+                          try {
+                            await persistence.saveUserMessage(
+                              currentConversationId,
+                              sttData.text,
+                              randomUUID()
+                            );
+                            logger.session('user_message_persisted', sessionId, userId, {
+                              contentLength: sttData.text.length,
+                              conversationId: currentConversationId,
+                            });
+                          } catch (error) {
+                            logger.error('persist_user_message_failed', {
+                              error: error.message,
+                              sessionId,
+                              userId,
+                            });
+                          }
+                        })();
+                      }
+
+                      // REST-only UX: do NOT auto-send STT finals to the model.
+                      // The client controls when to send via `client.text.turn`.
                     eventHandler.handleUserTranscript(sttData);
                   }, (sttError) => {
                     // Surface a clear actionable error to the client and avoid silent "listening".
@@ -541,41 +757,37 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
               // Track if this is first audio in the turn (already declared at connection scope)
               firstAudioInTurn = true;
               
-              vertexSession.on('audio', (audioBuffer) => {
-                // LATENCY KPI: Emit on first audio chunk
-                if (firstAudioInTurn) {
-                  sendEvent('server.kpi', {
-                    type: 'first_model_audio',
-                    atMs: Date.now(),
-                  });
-                  firstAudioInTurn = false;
-                }
-                
-                eventHandler.handleAudio(audioBuffer);
-              });
+              if (vertexSession) {
+                vertexSession.on('audio', (audioBuffer) => {
+                  // LATENCY KPI: Emit on first audio chunk
+                  if (firstAudioInTurn) {
+                    sendEvent('server.kpi', {
+                      type: 'first_model_audio',
+                      atMs: Date.now(),
+                    });
+                    firstAudioInTurn = false;
+                  }
 
-              vertexSession.on('bargeIn', () => {
-                logger.session('barge_in', sessionId, userId, {});
-                eventHandler.handleBargeIn();
-              });
-
-              vertexSession.on('draftUpdate', (patch) => {
-                eventHandler.handleDraftUpdate(patch);
-              });
-
-              vertexSession.on('narrativeUpdate', (data) => {
-                eventHandler.handleNarrativeUpdate(data);
-              });
-
-              vertexSession.on('error', (error) => {
-                logger.error('vertex.session_error', {
-                  session_id: sessionId,
-                  user_id: userId,
-                  error_code: error.code,
-                  error_message: error.message,
+                  eventHandler.handleAudio(audioBuffer);
                 });
-                eventHandler.sendError(error.message);
-              });
+
+                vertexSession.on('bargeIn', () => {
+                  logger.session('barge_in', sessionId, userId, {});
+                  eventHandler.handleBargeIn();
+                });
+              }
+
+              if (vertexSession) {
+                vertexSession.on('error', (error) => {
+                  logger.error('vertex.session_error', {
+                    session_id: sessionId,
+                    user_id: userId,
+                    error_code: error.code,
+                    error_message: error.message,
+                  });
+                  eventHandler.sendError(error.message);
+                });
+              }
 
             } catch (error) {
               // Enhanced error logging with stack trace in development
@@ -599,24 +811,23 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
           case 'client.audio.chunk':
           case 'client.audio.chunk.base64': {
             // Backward compatibility: accept both client.audio.chunk and client.audio.chunk.base64
-            if (!vertexSession || !authenticated || !vertexReady) {
+            if (!authenticated) {
               logger.warn('gateway.audio_chunk_rejected', {
                 session_id: sessionId,
-                reason: !vertexSession
-                  ? 'session_not_initialized'
-                  : !authenticated
-                    ? 'not_authenticated'
-                    : 'vertex_not_ready',
-              });
-              sendEvent('server.error', {
-                message: 'Session not initialized',
+                reason: 'not_authenticated',
               });
               return;
             }
 
             try {
               // Decode base64 PCM audio
-              const pcmBuffer = Buffer.from(message.payload.data, 'base64');
+              let pcmBuffer = Buffer.from(message.payload.data, 'base64');
+
+              // Ensure PCM16 frames are even length
+              if (pcmBuffer.length % 2 !== 0) {
+                pcmBuffer = pcmBuffer.subarray(0, pcmBuffer.length - 1);
+                if (pcmBuffer.length < 2) return;
+              }
               
               // Log audio chunk received (no audio content)
               logger.gateway('audio_chunk_received', {
@@ -624,10 +835,7 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
                 message_type: message.type,
               });
               
-              // Send to Vertex AI
-              await vertexSession.sendAudio(pcmBuffer);
-
-              // Also feed fallback STT if enabled and still using it
+              // Feed fallback STT (REST-only)
               if (sttFallbackEnabled && sttUsingFallback && stt) {
                 stt.write(pcmBuffer);
               }
@@ -649,48 +857,78 @@ const GATEWAY_STARTED_AT = new Date().toISOString();
           }
 
           case 'client.audio.turnComplete': {
-            if (!vertexSession || !authenticated || !vertexReady) {
-              logger.warn('gateway.turn_complete_rejected', {
+            // REST-only: accept but treat as a no-op (STT finalization is silence-based).
+            logger.gateway('turn_complete_received_from_client', {
+              session_id: sessionId,
+              user_id: userId,
+              timestamp: Date.now(),
+            });
+            firstAudioInTurn = true;
+            break;
+          }
+
+          case 'client.text.turn': {
+            if (!authenticated) {
+              logger.warn('gateway.text_turn_rejected', {
                 session_id: sessionId,
-                reason: !vertexSession
-                  ? 'session_not_initialized'
-                  : !authenticated
-                    ? 'not_authenticated'
-                    : 'vertex_not_ready',
+                reason: 'not_authenticated',
               });
               return;
             }
 
             try {
-              // LATENCY KPI: Record when turnComplete received at gateway
-              sendEvent('server.kpi', {
-                type: 'turnComplete_received',
-                atMs: Date.now(),
-              });
-              
-              logger.gateway('turn_complete_received_from_client', {
+              const text = message.payload?.text || '';
+              if (!text.trim()) return;
+
+              logger.gateway('text_turn_received_from_client', {
                 session_id: sessionId,
                 user_id: userId,
-                timestamp: Date.now(),
+                text_length: text.length,
               });
-              await vertexSession.sendTurnComplete();
-              
-              // Reset first audio flag for next turn
-              firstAudioInTurn = true;
-              
-              logger.gateway('turn_complete_forwarded_to_vertex', {
-                session_id: sessionId,
-                user_id: userId,
-              });
+
+              if (agentSession && agentReady) {
+                await agentSession.sendTextTurn(text);
+                logger.gateway('text_turn_forwarded_to_agent', {
+                  session_id: sessionId,
+                  user_id: userId,
+                });
+              } else if (vertexSession) {
+                // Ensure Vertex session is ready (may need to reconnect)
+                if (!vertexSession?.isConnected || !vertexSession?.isSetup || !vertexReady) {
+                  const ready = !vertexDisabled ? await ensureVertexSessionReady() : false;
+                  if (!ready) {
+                    logger.warn('gateway.text_turn_vertex_not_ready', {
+                      session_id: sessionId,
+                      user_id: userId,
+                    });
+                    sendEvent('server.error', {
+                      message: 'Text turn rejected: session not ready yet. Please wait for Ready state.',
+                      code: 'VERTEX_NOT_READY',
+                    });
+                    return;
+                  }
+                }
+
+                await vertexSession.sendTextTurn(text);
+                logger.gateway('text_turn_forwarded_to_vertex', {
+                  session_id: sessionId,
+                  user_id: userId,
+                });
+              } else {
+                sendEvent('server.error', {
+                  message: 'Text turn rejected: agent not ready and live session unavailable.',
+                  code: 'AGENT_NOT_READY',
+                });
+              }
             } catch (error) {
-              logger.error('gateway.turn_complete_failed', {
+              logger.error('gateway.text_turn_failed', {
                 session_id: sessionId,
                 user_id: userId,
                 error_code: error.code,
                 error_message: error.message,
               });
               sendEvent('server.error', {
-                message: `Turn complete error: ${error.message}`,
+                message: `Text turn error: ${error.message}`,
               });
             }
             break;

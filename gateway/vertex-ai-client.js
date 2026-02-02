@@ -1,17 +1,11 @@
-// Vertex AI Gemini Live API Client
+// Vertex AI Gemini REST client
 // Production-grade: Uses OAuth2 bearer tokens (service account)
-// Handles bidirectional audio streaming with Gemini
+// Text-in/text-out only (no Live WebSocket; no tool/function calling)
 
 import { VertexAI } from '@google-cloud/vertexai';
 import { GoogleAuth } from 'google-auth-library';
-import { readFileSync } from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
 import { config } from './config.js';
 import { logger } from './logger.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 /**
  * Vertex AI Session Manager
@@ -27,8 +21,6 @@ export class VertexAISession {
       transcript: [],
       audio: [],
       bargeIn: [],
-      draftUpdate: [],
-      narrativeUpdate: [],
       error: [],
     };
   }
@@ -45,7 +37,7 @@ export class VertexAISession {
 
       // Production: Use Application Default Credentials (ADC)
       // Cloud Run automatically uses the attached service account
-      if (process.env.NODE_ENV === 'production' || !config.firebase.serviceAccountPath) {
+      if (process.env.NODE_ENV === 'production') {
         // ADC is used automatically - no credentials needed
         logger.info('vertex.initializing', {
           method: 'application_default_credentials',
@@ -53,29 +45,12 @@ export class VertexAISession {
           location: config.vertexAI.location,
         });
       } else {
-        // Development: Use service account file if provided
-        try {
-          const serviceAccountPath = config.firebase.serviceAccountPath.startsWith('./')
-            ? join(__dirname, config.firebase.serviceAccountPath.replace('./', ''))
-            : config.firebase.serviceAccountPath;
-          
-          const serviceAccountJson = readFileSync(serviceAccountPath, 'utf8');
-          credentials = JSON.parse(serviceAccountJson);
-          authMethod = 'service_account_file';
-          
-          logger.info('vertex.initializing', {
-            method: 'service_account_file',
-            service_account: credentials.client_email,
-            project: config.vertexAI.projectId,
-            location: config.vertexAI.location,
-          });
-        } catch (e) {
-          logger.warn('vertex.service_account_file_failed', {
-            error: e.message,
-            fallback: 'application_default_credentials',
-          });
-          // Fallback to ADC
-        }
+        // Development: Use ADC
+        logger.info('vertex.initializing', {
+          method: 'application_default_credentials',
+          project: config.vertexAI.projectId,
+          location: config.vertexAI.location,
+        });
       }
 
       // Initialize Vertex AI with OAuth2 authentication
@@ -107,7 +82,7 @@ export class VertexAISession {
 
       // Create generative model instance
       this.generativeModel = this.vertexAI.getGenerativeModel({
-        model: config.vertexAI.model,
+        model: config.vertexAI.agentModel,
         generationConfig: {
           temperature: 0.7,
           topP: 0.95,
@@ -116,7 +91,7 @@ export class VertexAISession {
       });
 
       logger.info('vertex.initialized', {
-        model: config.vertexAI.model,
+        model: config.vertexAI.agentModel,
         project: config.vertexAI.projectId,
         location: config.vertexAI.location,
       });
@@ -138,10 +113,22 @@ export class VertexAISession {
    */
   async startSession() {
     try {
-      const systemInstruction = this.sessionConfig.system_instruction?.text || 
+      const baseSystemInstruction =
+        this.sessionConfig.system_instruction?.text ||
         'You are a helpful clinical intake specialist for adverse event reporting. ' +
-        'Ask follow-up questions until you have all 4 minimum criteria: ' +
-        '1) identifiable patient, 2) identifiable reporter, 3) suspect product, 4) adverse event.';
+          'Ask follow-up questions until you have all 4 minimum criteria: ' +
+          '1) identifiable patient, 2) identifiable reporter, 3) suspect product, 4) adverse event.';
+
+      // ENGLISH-ONLY ENFORCEMENT (hard rule):
+      // Some client configs include "Respond in the user's language" which will force Arabic, etc.
+      // The user requested English only, so we override any conflicting instruction here.
+      const englishOnlyRule =
+        'CRITICAL: Respond ONLY in English. ' +
+        'Do NOT use any other language. ' +
+        'If the user speaks another language, translate it and answer in English. ' +
+        'Ignore any earlier instruction that says to respond in the user\'s language.';
+
+      const systemInstruction = `${baseSystemInstruction}\n\n${englishOnlyRule}`;
       
       // Initialize chat with system instruction
       // TODO: Replace with Vertex Live WebSocket when available
@@ -166,50 +153,31 @@ export class VertexAISession {
   }
 
   /**
-   * Send audio chunk to Vertex AI
-   * @param {Buffer} pcm16k - PCM audio bytes (16kHz, s16le, mono)
-   * 
-   * NOTE: This uses standard chat API with inline audio
-   * For production Vertex Live, this should use bidirectional WebSocket
+   * Send a text turn to Vertex AI (REST)
+   * @param {string} text - User text to process
    */
-  async sendAudio(pcm16k) {
+  async sendTextTurn(text) {
     if (!this.chat) {
       throw new Error('Session not started');
     }
 
     try {
-      // Convert PCM to base64 for API
-      const audioBase64 = pcm16k.toString('base64');
-      
-      // Log audio chunk sent (no audio content)
-      logger.vertexAI('audio_chunk_sent', {
-        chunk_size_bytes: pcm16k.length,
-        has_audio: true,
-      });
-      
-      // Send audio to Gemini
-      // TODO: Replace with Vertex Live WebSocket bidirectional streaming
-      const result = await this.chat.sendMessageStream([
-        {
-          inlineData: {
-            mimeType: 'audio/pcm;rate=16000',
-            data: audioBase64,
-          },
-        },
-      ]);
-
+      const result = await this.chat.sendMessageStream(text);
       let chunkCount = 0;
-      // Handle streaming response
+      let sawTranscript = false;
       for await (const chunk of result.stream) {
         chunkCount++;
-        await this.handleResponseChunk(chunk);
+        const emitted = await this.handleResponseChunk(chunk);
+        if (emitted) sawTranscript = true;
       }
-      
-      logger.vertexAI('audio_response_received', {
-        chunk_count: chunkCount,
+
+      logger.vertexAI('text_response_received', {
+        chunkCount,
+        hasTranscript: sawTranscript,
+        hasAudio: false,
       });
     } catch (error) {
-      logger.error('vertex.audio_send_failed', {
+      logger.error('vertex.text_send_failed', {
         error_code: error.code,
         error_message: error.message,
       });
@@ -223,48 +191,72 @@ export class VertexAISession {
    */
   async handleResponseChunk(chunk) {
     try {
-      const response = chunk.response;
-      
-      // Extract text (transcript) - emit to handlers, but don't log content
-      if (response.text) {
+      const response = chunk?.response ?? chunk;
+      if (!response) {
+        return false;
+      }
+
+      const candidates = Array.isArray(response.candidates) ? response.candidates : [];
+      let emittedText = false;
+
+      if (!Array.isArray(response.candidates)) {
+        // Some SDK versions/stream events may not include candidates for a given chunk.
+        // Avoid throwing; just log the shape for debugging.
+        logger.warn('vertex.unexpected_response_chunk_shape', {
+          has_chunk_response: !!chunk?.response,
+          chunk_keys: chunk && typeof chunk === 'object' ? Object.keys(chunk).slice(0, 20) : [],
+          response_keys: response && typeof response === 'object' ? Object.keys(response).slice(0, 20) : [],
+        });
+      }
+
+      for (const candidate of candidates) {
+        const isPartial = candidate.finishReason !== 'STOP';
+        const parts = candidate.content?.parts || [];
+
+        for (const part of parts) {
+          if (part.text) {
+            emittedText = true;
+            logger.vertexAI('transcript_received', {
+              hasTranscript: true,
+              hasAudio: false,
+              chunkCount: 1,
+            });
+
+            this.emit('transcript', {
+              text: part.text,
+              isPartial,
+            });
+          }
+        }
+      }
+
+      // Fallback: some SDKs expose response.text directly
+      const responseText = typeof response.text === 'function' ? response.text() : response.text;
+      if (!emittedText && responseText) {
         const isPartial = response.candidates?.[0]?.finishReason !== 'STOP';
         logger.vertexAI('transcript_received', {
-          has_transcript: true,
-          is_partial: isPartial,
-          // No text content logged (PHI)
+          hasTranscript: true,
+          hasAudio: false,
+          chunkCount: 1,
         });
-        
+
         this.emit('transcript', {
-          text: response.text,
+          text: responseText,
           isPartial,
         });
+
+        emittedText = true;
       }
 
       // Extract audio output (24kHz PCM) - emit but don't log content
       if (response.audio) {
         const audioData = Buffer.from(response.audio, 'base64');
         logger.vertexAI('audio_received', {
-          has_audio: true,
-          audio_size_bytes: audioData.length,
+          hasAudio: true,
+          hasTranscript: false,
+          chunkCount: 1,
         });
         this.emit('audio', audioData);
-      }
-
-      // Extract function calls (for draft updates)
-      if (response.functionCalls) {
-        for (const call of response.functionCalls) {
-          logger.vertexAI('function_call_received', {
-            function_name: call.name,
-            // No args logged (may contain PHI)
-          });
-          
-          if (call.name === 'update_ae_draft') {
-            this.emit('draftUpdate', call.args);
-          }
-          if (call.name === 'update_narrative') {
-            this.emit('narrativeUpdate', call.args);
-          }
-        }
       }
 
       // Detect barge-in (user interruption)
@@ -272,12 +264,15 @@ export class VertexAISession {
         logger.vertexAI('barge_in_detected', {});
         this.emit('bargeIn');
       }
+
+      return emittedText;
     } catch (error) {
       logger.error('vertex.response_chunk_failed', {
         error_code: error.code,
         error_message: error.message,
       });
       this.emit('error', error);
+      return false;
     }
   }
 

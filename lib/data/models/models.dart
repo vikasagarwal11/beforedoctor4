@@ -1,3 +1,5 @@
+export 'conversation.dart';
+
 enum EpisodeStatus { active, completed }
 
 class PersonProfile {

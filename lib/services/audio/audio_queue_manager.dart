@@ -17,9 +17,10 @@ class AudioFrame {
 
 class AudioQueueManager {
   // Configuration
-  static const int _maxBufferMs = 800; // 0.8 seconds
+  static const int _maxBufferMs =
+      200; // 0.2 seconds max buffer to prevent batching
   static const int _chunkMs = 20; // 20ms per frame
-  static const int _maxQueuedFrames = _maxBufferMs ~/ _chunkMs; // 40 frames
+  static const int _maxQueuedFrames = _maxBufferMs ~/ _chunkMs; // 10 frames max
 
   // State
   final Queue<AudioFrame> _queue = Queue<AudioFrame>();
@@ -70,6 +71,13 @@ class AudioQueueManager {
     return batch;
   }
 
+  /// Force dequeue ALL frames immediately (for urgent flushing)
+  List<AudioFrame> dequeueAll() {
+    final batch = _queue.toList();
+    _queue.clear();
+    return batch;
+  }
+
   /// Clear all queued frames (e.g., on error or stop).
   void clear() {
     _queue.clear();
@@ -77,6 +85,10 @@ class AudioQueueManager {
 
   /// Get current queue depth in frames.
   int get queueDepthFrames => _queue.length;
+
+  /// Check if queue is getting full
+  bool get isQueueFull =>
+      _queue.length >= (_maxQueuedFrames ~/ 2); // Warn at 50% capacity
 
   /// Get current queue depth in milliseconds.
   int get queueDepthMs => queueDepthFrames * _chunkMs;

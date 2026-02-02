@@ -6,12 +6,16 @@ node_modules/
 .env.local
 .env.*.local
 
+# Local secrets (do not commit)
+config-secrets.js
+
 # Logs
 *.log
 npm-debug.log*
 
 # Firebase service account
 service-account-key.json
+gen-lang-client.json
 *-service-account.json
 
 # OS files

@@ -2,11 +2,10 @@
 // Production-grade: True bidirectional WebSocket connection to Vertex Live API
 // Replaces the placeholder chat-based implementation
 
-import WebSocket from 'ws';
 import { GoogleAuth } from 'google-auth-library';
-import { readFileSync } from 'fs';
+import { dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import WebSocket from 'ws';
 import { config } from './config.js';
 import { logger } from './logger.js';
 
@@ -29,6 +28,14 @@ export class VertexLiveWSSession {
     this.audioSendCounter = 0;
     this.audioReceiveCounter = 0;
     this.stopAudioForwarding = false; // Pause audio forwarding on barge-in
+    
+    // Keepalive mechanism for long sessions
+    this.keepaliveInterval = null;
+    this.lastActivityAt = Date.now();
+    
+    // Transcript caching to prevent loss due to timing issues
+    this.lastPartialTranscript = '';
+    this.lastFinalTranscript = '';
     this._hasLoggedRawMessage = false;
     this.eventHandlers = {
       transcript: [],
@@ -38,6 +45,7 @@ export class VertexLiveWSSession {
       draftUpdate: [],
       narrativeUpdate: [],
       error: [],
+      closed: [],
     };
   }
 
@@ -50,37 +58,13 @@ export class VertexLiveWSSession {
       let authMethod = 'application_default_credentials';
       let credentials = null;
 
-      // Production: Use Application Default Credentials (ADC)
-      if (process.env.NODE_ENV === 'production' || !config.firebase.serviceAccountPath) {
-        logger.info('vertex.initializing', {
-          method: 'application_default_credentials',
-          project: config.vertexAI.projectId,
-          location: config.vertexAI.location,
-        });
-      } else {
-        // Development: Use service account file if provided
-        try {
-          const serviceAccountPath = config.firebase.serviceAccountPath.startsWith('./')
-            ? join(__dirname, config.firebase.serviceAccountPath.replace('./', ''))
-            : config.firebase.serviceAccountPath;
-          
-          const serviceAccountJson = readFileSync(serviceAccountPath, 'utf8');
-          credentials = JSON.parse(serviceAccountJson);
-          authMethod = 'service_account_file';
-          
-          logger.info('vertex.initializing', {
-            method: 'service_account_file',
-            service_account: credentials.client_email,
-            project: config.vertexAI.projectId,
-            location: config.vertexAI.location,
-          });
-        } catch (e) {
-          logger.warn('vertex.service_account_file_failed', {
-            error: e.message,
-            fallback: 'application_default_credentials',
-          });
-        }
-      }
+      // Use Application Default Credentials (ADC)
+      // Cloud Run and local dev both use ADC
+      logger.info('vertex.initializing', {
+        method: 'application_default_credentials',
+        project: config.vertexAI.projectId,
+        location: config.vertexAI.location,
+      });
 
       // Initialize Google Auth for OAuth2 token
       this.auth = new GoogleAuth({
@@ -175,6 +159,7 @@ export class VertexLiveWSSession {
         }
         this.isConnected = false;
         this.isSetup = false;
+        this.emit('closed', { code, reason: reason?.toString() });
       });
 
       // Handle errors
@@ -191,7 +176,7 @@ export class VertexLiveWSSession {
       await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error('WebSocket connection timeout'));
-        }, 10000);
+        }, 60000); // Increased from 10s to 60s for slow networks
 
         this.ws.once('open', () => {
           clearTimeout(timeout);
@@ -208,7 +193,7 @@ export class VertexLiveWSSession {
       await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error('Setup message timeout'));
-        }, 15000);
+        }, 30000); // Increased from 15s to 30s for reliable setup
 
         const checkSetup = setInterval(() => {
           if (this.lastError) {
@@ -229,10 +214,12 @@ export class VertexLiveWSSession {
           clearInterval(checkSetup);
           reject(error);
         };
-        const onClose = (code) => {
+        const onClose = (code, reason) => {
           clearTimeout(timeout);
           clearInterval(checkSetup);
-          reject(new Error(`WebSocket closed before setup complete (code ${code})`));
+          const reasonText = reason?.toString?.() || '';
+          const detail = reasonText ? `, reason: ${reasonText}` : '';
+          reject(new Error(`WebSocket closed before setup complete (code ${code}${detail})`));
         };
 
         this.ws.once('error', onError);
@@ -242,6 +229,9 @@ export class VertexLiveWSSession {
       logger.info('vertex.session_started', {
         has_system_instruction: !!this.sessionConfig.system_instruction,
       });
+
+      // Start keepalive ping to prevent session timeout during long audio captures
+      this._startKeepalive();
 
     } catch (error) {
       logger.error('vertex.session_start_failed', {
@@ -253,144 +243,73 @@ export class VertexLiveWSSession {
   }
 
   /**
+   * Start keepalive mechanism to prevent session timeout
+   * Sends periodic activity to keep the WebSocket connection alive
+   */
+  _startKeepalive() {
+    // Clear any existing keepalive
+    if (this.keepaliveInterval) {
+      clearInterval(this.keepaliveInterval);
+    }
+
+    // Send keepalive ping every 30 seconds
+    this.keepaliveInterval = setInterval(() => {
+      if (this.ws && this.isConnected && this.isSetup) {
+        const timeSinceActivity = Date.now() - this.lastActivityAt;
+        
+        // Only send ping if no activity for 25 seconds
+        if (timeSinceActivity > 25000) {
+          try {
+            // Send a small setup message as keepalive (no-op that keeps connection alive)
+            this.ws.ping(() => {
+              logger.debug('vertex.keepalive_sent', { 
+                time_since_activity_ms: timeSinceActivity 
+              });
+            });
+            this.lastActivityAt = Date.now();
+          } catch (error) {
+            logger.warn('vertex.keepalive_failed', { 
+              error_message: error?.message || String(error) 
+            });
+          }
+        }
+      }
+    }, 30000); // Check every 30 seconds
+
+    logger.info('vertex.keepalive_started', { interval_ms: 30000 });
+  }
+
+  /**
+   * Stop keepalive mechanism
+   */
+  _stopKeepalive() {
+    if (this.keepaliveInterval) {
+      clearInterval(this.keepaliveInterval);
+      this.keepaliveInterval = null;
+      logger.info('vertex.keepalive_stopped');
+    }
+  }
+
+  /**
    * Send setup message (first message after connection)
    * This defines the "Brain" of the agent
    */
   _sendSetupMessage() {
     try {
-      // Get language code and determine output language
-      const languageCode = this.sessionConfig.language_code || 'en-US';
-      const outputLanguage = languageCode.startsWith('en') ? 'ENGLISH' : 
-                            languageCode.startsWith('es') ? 'SPANISH' :
-                            languageCode.startsWith('fr') ? 'FRENCH' :
-                            languageCode.startsWith('de') ? 'GERMAN' :
-                            languageCode.startsWith('hi') ? 'HINDI' :
-                            'ENGLISH'; // Default to English
-
-      const systemInstruction = this.sessionConfig.system_instruction?.text || 
-        '**Persona:**\n' +
-        'You are a professional PV (Pharmacovigilance) Intake Specialist for adverse event reporting. ' +
-        'You are empathetic, thorough, and professional.\n\n' +
-        '**Conversational Rules:**\n' +
-        '1. **Intake:** Ask follow-up questions until you have all 4 minimum criteria: ' +
-        '1) identifiable patient (age OR gender OR initials), ' +
-        '2) identifiable reporter (role OR contact OR authenticated user), ' +
-        '3) suspect product (name), ' +
-        '4) adverse event (symptom(s) or narrative).\n' +
-        '2. **Data Collection:** Use the update_ae_draft tool to update the adverse event report as you gather information. ' +
-        'Invoke this tool after each relevant piece of information is provided by the user.\n' +
-        '3. **Conversational Flow:** You may engage in follow-up questions and clarifications as long as the user wants to provide information.\n\n' +
-        '**Language Requirement:**\n' +
-        `RESPOND IN ${outputLanguage}. YOU MUST RESPOND UNMISTAKABLY IN ${outputLanguage}.\n\n` +
-        '**Guardrails:**\n' +
-        'If the user reports severe symptoms or emergency situations, acknowledge their concern and ensure they understand when to seek immediate medical care.';
-
       const setupMessage = {
         setup: {
           model: `projects/${config.vertexAI.projectId}/locations/${config.vertexAI.location}/publishers/google/models/${config.vertexAI.model}`,
-          generationConfig: {
-            // Note: Only one response modality can be specified
-            // Use AUDIO for audio output, then enable outputAudioTranscription for text transcripts
-            // Language is handled via systemInstruction instead of language_code
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: 'Puck', // Professional, empathetic voice
-                },
-              },
-            },
-            temperature: 0.7,
-            topP: 0.95,
-            topK: 40,
-            // Note: context_window_compression_config is not supported in Vertex AI Live API
-            // Context management is handled automatically by the service
-          },
-          systemInstruction: {
-            parts: [
-              {
-                text: systemInstruction,
-              },
-            ],
-          },
-          // Enable transcription for both input (user speech) and output (model audio)
-          // This allows us to get text transcripts even though responseModalities only has AUDIO
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          tools: [
-            {
-              functionDeclarations: [
-                {
-                  name: 'update_ae_draft',
-                  description: 'Update the adverse event report draft with extracted information',
-                  parameters: {
-                    type: 'OBJECT',
-                    properties: {
-                      patient_info: {
-                        type: 'OBJECT',
-                        properties: {
-                          initials: { type: 'STRING' },
-                          age: { type: 'INTEGER' },
-                          gender: { type: 'STRING' },
-                        },
-                      },
-                      product_details: {
-                        type: 'OBJECT',
-                        properties: {
-                          product_name: { type: 'STRING' },
-                          dosage_strength: { type: 'STRING' },
-                          frequency: { type: 'STRING' },
-                          indication: { type: 'STRING' },
-                          lot_number: { type: 'STRING' },
-                        },
-                      },
-                      event_details: {
-                        type: 'OBJECT',
-                        properties: {
-                          symptoms: {
-                            type: 'ARRAY',
-                            items: { type: 'STRING' },
-                          },
-                          onset_date: { type: 'STRING' },
-                          duration: { type: 'STRING' },
-                          outcome: { type: 'STRING' },
-                          narrative: { type: 'STRING' },
-                        },
-                      },
-                      seriousness: { type: 'STRING' },
-                    },
-                  },
-                },
-                {
-                  name: 'update_narrative',
-                  description: 'Update the narrative summary of the adverse event',
-                  parameters: {
-                    type: 'OBJECT',
-                    properties: {
-                      narrative: { type: 'STRING' },
-                    },
-                  },
-                },
-              ],
-            },
-          ],
         },
       };
 
       this.ws.send(JSON.stringify(setupMessage));
       logger.info('vertex.setup_sent', {
         model: setupMessage.setup.model,
-        language_code: languageCode,
-        has_tools: setupMessage.setup.tools.length > 0,
-        has_compression: !!setupMessage.setup.generationConfig?.context_window_compression_config,
       });
       // Log raw setup message for debugging (truncated for size)
       logger.info('vertex.setup_message_raw', {
         message_preview: JSON.stringify(setupMessage).substring(0, 200),
         model: setupMessage.setup.model,
-        has_generationConfig: !!setupMessage.setup.generationConfig,
-        has_systemInstruction: !!setupMessage.setup.systemInstruction,
-        has_tools: setupMessage.setup.tools.length > 0,
       });
 
     } catch (error) {
@@ -483,6 +402,7 @@ export class VertexLiveWSSession {
           logger.vertexAI('user_transcript_received', {
             has_transcript: true,
             is_partial: isPartial,
+            text_preview: inputTranscript.text.substring(0, 100),
           });
           this.emit('userTranscript', {
             text: inputTranscript.text,
@@ -493,6 +413,7 @@ export class VertexLiveWSSession {
         // Handle model turn (audio + text output)
         if (message.serverContent.modelTurn) {
           const parts = message.serverContent.modelTurn.parts || [];
+          const isCompleted = message.serverContent.modelTurn.complete === true;
 
           for (const part of parts) {
             // Handle audio output (24kHz PCM)
@@ -517,16 +438,16 @@ export class VertexLiveWSSession {
               }
             }
 
-            // Handle text (transcript)
+            // Handle text (transcript) from model response
             if (part.text) {
-              const isPartial = !message.serverContent.modelTurn.complete;
               logger.vertexAI('transcript_received', {
                 has_transcript: true,
-                is_partial: isPartial,
+                is_partial: !isCompleted,
+                text_preview: part.text.substring(0, 100),
               });
               this.emit('transcript', {
                 text: part.text,
-                isPartial: isPartial,
+                isPartial: !isCompleted,
               });
             }
 
@@ -570,6 +491,7 @@ export class VertexLiveWSSession {
             has_transcript: true,
             is_partial: isPartial,
             text_length: outputTranscript.text.length,
+            text_preview: outputTranscript.text.substring(0, 100),
           });
           // Emit as transcript (same event as modelTurn.parts[].text for consistency)
           this.emit('transcript', {
@@ -577,6 +499,20 @@ export class VertexLiveWSSession {
             isPartial: isPartial,
           });
         }
+
+        // CRITICAL: Also check for standalone text parts in serverContent
+        // (not under modelTurn, but at top level of serverContent)
+        if (message.serverContent.text) {
+          logger.vertexAI('standalone_text_received', {
+            has_text: true,
+            text_length: message.serverContent.text.length,
+            text_preview: message.serverContent.text.substring(0, 100),
+          });
+          this.emit('transcript', {
+            text: message.serverContent.text,
+            isPartial: !message.serverContent.complete,
+          });
+        } 
       }
 
       // Log unrecognized message shapes (for debugging setup issues)
@@ -608,6 +544,7 @@ export class VertexLiveWSSession {
     } catch (error) {
       logger.error('vertex.message_handle_failed', {
         error_message: error.message,
+        error_stack: error.stack,
       });
       this.emit('error', error);
     }
@@ -623,6 +560,9 @@ export class VertexLiveWSSession {
     }
 
     try {
+      // Update activity timestamp for keepalive
+      this.lastActivityAt = Date.now();
+      
       // Convert PCM to base64
       const audioBase64 = pcm16k.toString('base64');
 
@@ -646,7 +586,7 @@ export class VertexLiveWSSession {
                 {
                   inlineData: {
                     data: audioBase64,
-                    mimeType: 'audio/pcm;rate=16000',
+                    mimeType: 'audio/l16;rate=16000',
                   },
                 },
               ],
@@ -665,6 +605,51 @@ export class VertexLiveWSSession {
       });
       this.emit('error', error);
       throw error; // CRITICAL: fail fast so gateway can recover
+    }
+  }
+
+  /**
+   * Send a text turn to Vertex Live API (used for edited transcripts)
+   * @param {string} text - User text to process
+   */
+  async sendTextTurn(text) {
+    if (!this.ws || !this.isConnected || !this.isSetup) {
+      throw new Error('Session not ready - WebSocket not connected or setup not complete');
+    }
+
+    try {
+      if (!text || !text.trim()) return;
+
+      this.lastActivityAt = Date.now();
+
+      const inputMessage = {
+        clientContent: {
+          turns: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: text,
+                },
+              ],
+            },
+          ],
+          turnComplete: true,
+        },
+      };
+
+      this.ws.send(JSON.stringify(inputMessage));
+
+      logger.vertexAI('text_turn_sent', {
+        text_length: text.length,
+      });
+    } catch (error) {
+      logger.error('vertex.text_turn_send_failed', {
+        error_code: error.code,
+        error_message: error.message,
+      });
+      this.emit('error', error);
+      throw error;
     }
   }
 
@@ -824,6 +809,9 @@ export class VertexLiveWSSession {
    */
   async close() {
     try {
+      // Stop keepalive before closing
+      this._stopKeepalive();
+      
       if (this.ws) {
         this.ws.close();
         this.ws = null;

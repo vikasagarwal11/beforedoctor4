@@ -46,18 +46,26 @@ class MockGatewayClient implements IGatewayClient {
     _timer?.cancel();
     _timer = Timer(const Duration(seconds: 2), () {
       _emit(GatewayEventType.sessionState, {'state': 'listening'});
-      _emit(GatewayEventType.transcriptPartial, {'text': 'I started Advil yesterday and now I feel nausea...'});
+      _emit(GatewayEventType.transcriptPartial,
+          {'text': 'I started Advil yesterday and now I feel nausea...'});
 
       // Patch product name
       _emit(GatewayEventType.aeDraftUpdate, {
         'patch': {
-          'product_details': {'product_name': 'Advil', 'dosage_strength': '200mg'},
-          'event_details': {'symptoms': ['nausea']},
+          'product_details': {
+            'product_name': 'Advil',
+            'dosage_strength': '200mg'
+          },
+          'event_details': {
+            'symptoms': ['nausea']
+          },
         }
       });
 
       // Narrative preview update
-      _emit(GatewayEventType.narrativeUpdate, {'text': 'After starting Advil (200mg), the patient reported nausea.'});
+      _emit(GatewayEventType.narrativeUpdate, {
+        'text': 'After starting Advil (200mg), the patient reported nausea.'
+      });
 
       // Simulate barge-in: stop audio (even though mock doesn't send audio)
       _emit(GatewayEventType.audioStop, {'reason': 'interrupted'});
@@ -66,7 +74,8 @@ class MockGatewayClient implements IGatewayClient {
       Timer(const Duration(seconds: 3), () {
         _emit(GatewayEventType.emergency, {
           'severity': 'high',
-          'banner': 'If you are experiencing chest pain or trouble breathing, seek urgent care immediately.'
+          'banner':
+              'If you are experiencing chest pain or trouble breathing, seek urgent care immediately.'
         });
       });
     });
@@ -81,10 +90,11 @@ class MockGatewayClient implements IGatewayClient {
     // In mock mode, treat audio as "user spoke" and emit a draft update.
     // (You can expand this to parse keywords.)
     if (!_connected) {
-      _logger.warn('mock_gateway.audio_rejected', data: {'reason': 'not_connected'});
+      _logger.warn('mock_gateway.audio_rejected',
+          data: {'reason': 'not_connected'});
       return;
     }
-    
+
     // Log audio received (every 50th chunk to avoid spam)
     _mockAudioCounter++;
     if (_mockAudioCounter % 50 == 0) {
@@ -93,8 +103,10 @@ class MockGatewayClient implements IGatewayClient {
         'total_chunks': _mockAudioCounter,
       });
     }
-    
-    _emit(GatewayEventType.userTranscriptPartial, {'text': '[mock] receiving audio chunk (${base64Pcm16k.length} b64 chars)'});
+
+    _emit(GatewayEventType.userTranscriptPartial, {
+      'text': '[mock] receiving audio chunk (${base64Pcm16k.length} b64 chars)'
+    });
   }
 
   @override
@@ -107,7 +119,8 @@ class MockGatewayClient implements IGatewayClient {
         'total_chunks': _mockAudioCounter,
       });
     }
-    _emit(GatewayEventType.userTranscriptPartial, {'text': '[mock] receiving binary audio (${pcm16k.length} bytes)'});
+    _emit(GatewayEventType.userTranscriptPartial,
+        {'text': '[mock] receiving binary audio (${pcm16k.length} bytes)'});
   }
 
   @override
@@ -115,7 +128,22 @@ class MockGatewayClient implements IGatewayClient {
     if (!_connected) return;
     _logger.info('mock_gateway.turn_complete_received');
     // In mock mode, turnComplete triggers a final transcript
-    _emit(GatewayEventType.userTranscriptFinal, {'text': '[mock] User finished speaking'});
+    _emit(GatewayEventType.userTranscriptFinal,
+        {'text': '[mock] User finished speaking'});
+  }
+
+  @override
+  Future<void> sendTextTurn(String text, {String? conversationId}) async {
+    if (!_connected) return;
+    if (text.trim().isEmpty) return;
+    _logger.info('mock_gateway.text_turn_received', data: {
+      'text_length': text.length,
+    });
+    // Emit a mock assistant response
+    _emit(GatewayEventType.transcriptFinal, {
+      'text':
+          '[mock] Structured medical summary for: ${text.substring(0, text.length.clamp(0, 50))}...'
+    });
   }
 
   @override

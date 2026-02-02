@@ -1,10 +1,10 @@
 // Setup Verification Script
 // Checks if everything is configured correctly
 
-import { config } from './config.js';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
 import { existsSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+import { config } from './config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -70,10 +70,10 @@ try {
 }
 
 try {
-  await import('firebase-admin');
-  console.log('✅ firebase-admin');
+  await import('@supabase/supabase-js');
+  console.log('✅ @supabase/supabase-js');
 } catch (e) {
-  console.error('❌ firebase-admin package not found');
+  console.error('❌ @supabase/supabase-js package not found');
   allGood = false;
 }
 

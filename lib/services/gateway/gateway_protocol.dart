@@ -11,7 +11,6 @@
 import 'dart:convert';
 
 enum GatewayEventType {
-<<<<<<< HEAD
   gatewayInfo, // server.gateway.info
   kpi, // server.kpi
   sessionState, // server.session.state
@@ -25,20 +24,7 @@ enum GatewayEventType {
   audioStop, // server.audio.stop       (barge-in / flush playback)
   emergency, // server.triage.emergency
   error, // server.error
-=======
-  sessionState,            // server.session.state
-  userTranscriptPartial,   // server.user.transcript.partial
-  userTranscriptFinal,     // server.user.transcript.final
-  transcriptPartial,       // server.transcript.partial
-  transcriptFinal,         // server.transcript.final
-  narrativeUpdate,         // server.narrative.update  (string or patch)
-  aeDraftUpdate,           // server.ae_draft.update   (json patch)
-  audioOut,                // server.audio.out        (base64 pcm24k s16le)
-  audioStop,               // server.audio.stop       (barge-in / flush playback)
-  emergency,               // server.triage.emergency
-  error,                   // server.error
-  unknown,                 // unrecognized event types (logged but ignored)
->>>>>>> 9355153449b734b1f5ac71afb47356d723984193
+  unknown, // unrecognized event types (logged but ignored)
 }
 
 /// Canonical envelope: { type: string, payload: object, seq?: int }
@@ -56,20 +42,16 @@ class GatewayEvent {
     final eventType = _mapType(t);
 
     // Store original type string in payload for debugging unknown events
-    final payload = (json['payload'] as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
-    if (eventType == GatewayEventType.unknown || eventType == GatewayEventType.error) {
+    final payload = (json['payload'] as Map?)?.cast<String, dynamic>() ??
+        <String, dynamic>{};
+    if (eventType == GatewayEventType.unknown ||
+        eventType == GatewayEventType.error) {
       payload['_original_type'] = t;
     }
 
     return GatewayEvent(
-<<<<<<< HEAD
-      type: _mapType(t),
-      payload: (json['payload'] as Map?)?.cast<String, dynamic>() ??
-          const <String, dynamic>{},
-=======
       type: eventType,
       payload: payload,
->>>>>>> 9355153449b734b1f5ac71afb47356d723984193
       seq: seq,
     );
   }
@@ -112,15 +94,24 @@ class GatewayEvent {
 // --------------------- Client → Gateway helpers ---------------------
 
 String clientHello({
-  required String firebaseIdToken,
+  required String firebaseIdToken, // Keeping param name for compatibility
   required Map<String, dynamic> sessionConfig,
+  String? conversationId, // Optional conversation ID for persistence
 }) {
+  final payload = {
+    'supabase_access_token':
+        firebaseIdToken, // Send as supabase_access_token to server
+    'session_config': sessionConfig,
+  };
+
+  // Add conversation_id if provided
+  if (conversationId != null && conversationId.isNotEmpty) {
+    payload['conversation_id'] = conversationId;
+  }
+
   return jsonEncode({
     'type': 'client.hello',
-    'payload': {
-      'firebase_id_token': firebaseIdToken,
-      'session_config': sessionConfig,
-    }
+    'payload': payload,
   });
 }
 
@@ -149,6 +140,22 @@ String clientStop() {
 /// Signal end of user utterance (turnComplete: true)
 String clientTurnComplete() {
   return jsonEncode({'type': 'client.audio.turnComplete', 'payload': {}});
+}
+
+/// Send a text turn (e.g., edited transcript) to the gateway.
+String clientTextTurn({required String text, String? conversationId}) {
+  final payload = {
+    'text': text,
+  };
+
+  if (conversationId != null && conversationId.isNotEmpty) {
+    payload['conversation_id'] = conversationId;
+  }
+
+  return jsonEncode({
+    'type': 'client.text.turn',
+    'payload': payload,
+  });
 }
 
 /// Signal barge-in: user speaking while AI is responding (interrupt + cancel server audio)

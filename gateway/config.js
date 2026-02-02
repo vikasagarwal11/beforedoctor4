@@ -1,6 +1,6 @@
 // Configuration loader
-// Production-grade: Uses Application Default Credentials (ADC) for Vertex AI
-// No API keys - uses service account OAuth2 bearer tokens
+// Production-grade: Uses Supabase for authentication and storage
+// Vertex AI uses Application Default Credentials (ADC) for authentication
 
 import dotenv from 'dotenv';
 import fs from 'fs';
@@ -10,10 +10,6 @@ import { fileURLToPath } from 'url';
 // Load .env for local development
 dotenv.config();
 
-// In local development, many Google SDK clients (e.g. Speech-to-Text) require
-// Application Default Credentials via GOOGLE_APPLICATION_CREDENTIALS.
-// We already rely on a service account JSON for Firebase Admin; reuse it as ADC
-// unless the user explicitly sets GOOGLE_APPLICATION_CREDENTIALS.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -21,10 +17,6 @@ function resolveMaybeRelativePath(maybePath) {
   if (!maybePath) return undefined;
   return path.isAbsolute(maybePath) ? maybePath : path.resolve(__dirname, maybePath);
 }
-
-const resolvedFirebaseServiceAccountPath = resolveMaybeRelativePath(
-  process.env.FIREBASE_SERVICE_ACCOUNT_PATH,
-);
 
 const resolvedGoogleApplicationCredentialsPath = resolveMaybeRelativePath(
   process.env.GOOGLE_APPLICATION_CREDENTIALS,
@@ -40,28 +32,22 @@ if (resolvedGoogleApplicationCredentialsPath) {
   }
 }
 
-if (!process.env.GOOGLE_APPLICATION_CREDENTIALS && resolvedFirebaseServiceAccountPath) {
-  try {
-    if (fs.existsSync(resolvedFirebaseServiceAccountPath)) {
-      process.env.GOOGLE_APPLICATION_CREDENTIALS = resolvedFirebaseServiceAccountPath;
-    }
-  } catch {
-    // Ignore filesystem errors; clients will report missing ADC if needed.
-  }
-}
-
 export const config = {
   vertexAI: {
     // No API key - uses service account OAuth2 bearer tokens
     projectId: process.env.VERTEX_AI_PROJECT_ID || 'gen-lang-client-0337309484',
     location: process.env.VERTEX_AI_LOCATION || 'us-central1',
-    model: process.env.VERTEX_AI_MODEL || 'gemini-live-2.5-flash-native-audio',
+    // Live model is optional and disabled by default
+    model: process.env.VERTEX_AI_MODEL || 'gemini-1.5-pro-live',
+    // REST agent model (used for STT -> AI -> TTS flow)
+    agentModel: process.env.VERTEX_AI_AGENT_MODEL || 'gemini-2.0-flash',
+    liveEnabled: process.env.VERTEX_AI_LIVE_ENABLED === 'true',
   },
-  firebase: {
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    // Local dev: path to service account JSON
-    // Cloud Run: uses Application Default Credentials (ADC) automatically
-    serviceAccountPath: resolvedFirebaseServiceAccountPath,
+  supabase: {
+    url: process.env.SUPABASE_URL,
+    anonKey: process.env.SUPABASE_ANON_KEY,
+    serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    storageBucket: process.env.SUPABASE_STORAGE_BUCKET || 'audio-files',
   },
   google: {
     applicationCredentialsPath: process.env.GOOGLE_APPLICATION_CREDENTIALS,
@@ -89,6 +75,10 @@ export const config = {
 if (!config.vertexAI.projectId) {
   console.error('ERROR: VERTEX_AI_PROJECT_ID is required');
   process.exit(1);
+}
+
+if (!config.supabase.url || !config.supabase.serviceRoleKey) {
+  console.warn('WARNING: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY should be set for production');
 }
 
 export default config;

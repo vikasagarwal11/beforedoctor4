@@ -1,8 +1,7 @@
 // Test script to verify Vertex AI connection with service account
 import { VertexAI } from '@google-cloud/vertexai';
-import { readFileSync } from 'fs';
+import { dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
 import { config } from './config.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -14,19 +13,9 @@ async function testVertexAI() {
   try {
     // Load service account if available
     let credentials = null;
-    if (config.firebase.serviceAccountPath) {
-      try {
-        const serviceAccountPath = config.firebase.serviceAccountPath.startsWith('./')
-            ? join(__dirname, config.firebase.serviceAccountPath.replace('./', ''))
-            : config.firebase.serviceAccountPath;
-        const serviceAccountJson = readFileSync(serviceAccountPath, 'utf8');
-        credentials = JSON.parse(serviceAccountJson);
-        console.log('✅ Service account loaded:', credentials.client_email);
-      } catch (e) {
-        console.warn('⚠️  Could not load service account:', e.message);
-        console.log('   Will use default credentials (Application Default Credentials)');
-      }
-    }
+    // Service account setup is now handled by GOOGLE_APPLICATION_CREDENTIALS
+    // or Application Default Credentials (ADC)
+    console.log('   Using Application Default Credentials (ADC)');
 
     // Initialize Vertex AI
     const vertexAI = new VertexAI({

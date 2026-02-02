@@ -21,15 +21,19 @@ export class GatewayEventHandler {
    * Handle transcript from Vertex AI
    */
   handleTranscript(data) {
+    // Default behavior: emit only the final assistant message.
+    // Streaming produces partial chunks first, then a final chunk, which many UIs
+    // mistakenly render as "two responses". If you want streaming, set
+    // `ASSISTANT_EMIT_PARTIALS=true`.
+    const emitPartials = process.env.ASSISTANT_EMIT_PARTIALS === 'true';
+
     if (data.isPartial) {
-      this.sendEvent('server.transcript.partial', {
-        text: data.text,
-      });
-    } else {
-      this.sendEvent('server.transcript.final', {
-        text: data.text,
-      });
+      if (!emitPartials) return;
+      this.sendEvent('server.transcript.partial', { text: data.text });
+      return;
     }
+
+    this.sendEvent('server.transcript.final', { text: data.text });
   }
 
   /**
@@ -65,30 +69,6 @@ export class GatewayEventHandler {
     this.sendEvent('server.audio.stop', {
       reason: 'interrupted',
     });
-  }
-
-  /**
-   * Handle draft update from function call
-   */
-  handleDraftUpdate(patch) {
-    this.sendEvent('server.ae_draft.update', {
-      patch: patch,
-    });
-  }
-
-  /**
-   * Handle narrative update
-   */
-  handleNarrativeUpdate(data) {
-    if (typeof data === 'string') {
-      this.sendEvent('server.narrative.update', {
-        text: data,
-      });
-    } else if (data.patch) {
-      this.sendEvent('server.narrative.update', {
-        patch: data.patch,
-      });
-    }
   }
 
   /**
