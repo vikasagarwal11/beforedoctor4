@@ -126,7 +126,7 @@ class MockGatewayClient implements IGatewayClient {
   }
 
   @override
-  Future<void> sendTurnComplete() async {
+  Future<void> sendTurnComplete({bool transcribeOnly = false}) async {
     if (!_connected) return;
     _logger.info('mock_gateway.turn_complete_received');
     // In mock mode, turnComplete triggers a final transcript

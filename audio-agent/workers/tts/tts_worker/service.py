@@ -79,6 +79,8 @@ class TtsService:
         kwargs["language_idx"] = "en"  # Explicit English for better quality
         # Use longer conditioning for quality
         kwargs["use_gpt_cond_len"] = True
+        # Avoid internal sentence splitting to keep short responses contiguous
+        kwargs["split_sentences"] = False
         kwargs["top_k"] = 250  # Reduce randomness for consistency
         kwargs["top_p"] = 0.85  # Nucleus sampling for diversity
         kwargs["temperature"] = 0.75  # Slightly lower for clearer speech

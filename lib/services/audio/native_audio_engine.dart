@@ -402,10 +402,14 @@ class _NativePlayback implements IAudioPlayback {
   bool _setupComplete = false;
   final AppLogger _logger = AppLogger.instance;
 
+  // Strict FIFO queue for audio chunks (prevents overwriting/dropping)
+  final List<Uint8List> _audioQueue = [];
+  bool _drainInProgress = false;
+
   @override
   bool get isPlaying => _setupComplete;
 
-  /// Setup: One-time initialization of audio session
+  /// Setup: One-time initialization of audio session at EXACTLY 24kHz mono
   /// Must be called before any play/feed operations
   @override
   Future<void> setup() async {
@@ -427,10 +431,14 @@ class _NativePlayback implements IAudioPlayback {
             data: {'error': e.toString()});
       }
 
+      // Clear any stale queue from previous session
+      _audioQueue.clear();
+      _drainInProgress = false;
+
       // Small delay to let audio session settle
       await Future.delayed(const Duration(milliseconds: 100));
 
-      // Initialize audio session
+      // Initialize audio session at EXACTLY 24kHz mono
       await FlutterPcmSound.setup(
         sampleRate: _targetSampleRate,
         channelCount: _targetChannels,
@@ -440,6 +448,7 @@ class _NativePlayback implements IAudioPlayback {
       _logger.info('audio.playback_setup_complete', data: {
         'sample_rate': _targetSampleRate,
         'channels': _targetChannels,
+        'format': 'PCM16LE',
       });
     } catch (e) {
       _setupInitiated = false;
@@ -454,6 +463,7 @@ class _NativePlayback implements IAudioPlayback {
   @override
   Future<void> prepare() async => setup();
 
+  /// Feed PCM24k chunk to FIFO queue (never drops, never reorders)
   @override
   Future<void> feed(Uint8List pcm24k) async {
     // Guard: ensure setup happened first
@@ -473,23 +483,56 @@ class _NativePlayback implements IAudioPlayback {
       }
     }
 
-    try {
-      if (pcm24k.isEmpty) {
-        _logger.warn('audio.empty_playback_chunk');
-        return;
-      }
+    if (pcm24k.isEmpty) {
+      _logger.warn('audio.empty_playback_chunk');
+      return;
+    }
 
-      // Convert Uint8List to ByteData for PcmArrayInt16
-      final byteData =
-          pcm24k.buffer.asByteData(pcm24k.offsetInBytes, pcm24k.length);
+    // Enqueue chunk (FIFO - never drops)
+    _audioQueue.add(pcm24k);
 
-      // Feed to FlutterPcmSound - don't log every chunk to avoid spam
-      await FlutterPcmSound.feed(PcmArrayInt16(bytes: byteData));
-    } catch (e) {
-      _logger.error('audio.playback_feed_failed', error: e, data: {
-        'chunk_size': pcm24k.length,
+    // Log queue growth every 10 chunks to detect backup
+    if (_audioQueue.length % 10 == 0) {
+      _logger.info('audio.playback_queue_depth', data: {
+        'queue_length': _audioQueue.length,
+        'total_bytes':
+            _audioQueue.fold<int>(0, (sum, chunk) => sum + chunk.length),
       });
-      // Don't rethrow - allow the drain loop to continue
+    }
+
+    // Drain queue asynchronously (fire-and-forget)
+    _drainQueue();
+  }
+
+  /// Drain queue: Feed chunks to FlutterPcmSound sequentially
+  /// Prevents overlapping feed() calls which can cause corruption
+  Future<void> _drainQueue() async {
+    if (_drainInProgress || _audioQueue.isEmpty) {
+      return;
+    }
+
+    _drainInProgress = true;
+
+    try {
+      while (_audioQueue.isNotEmpty) {
+        final chunk = _audioQueue.removeAt(0); // FIFO - take from front
+
+        try {
+          // Convert Uint8List to ByteData for PcmArrayInt16
+          final byteData =
+              chunk.buffer.asByteData(chunk.offsetInBytes, chunk.length);
+
+          // Feed to FlutterPcmSound (blocks until hardware buffer has space)
+          await FlutterPcmSound.feed(PcmArrayInt16(bytes: byteData));
+        } catch (e) {
+          _logger.error('audio.playback_feed_failed', error: e, data: {
+            'chunk_size': chunk.length,
+          });
+          // Continue with next chunk even if one fails
+        }
+      }
+    } finally {
+      _drainInProgress = false;
     }
   }
 
@@ -503,9 +546,15 @@ class _NativePlayback implements IAudioPlayback {
     }
 
     try {
+      // Clear queue to prevent stale audio from playing
+      _audioQueue.clear();
+      _drainInProgress = false;
+
       await FlutterPcmSound.stop();
       _setupComplete = false;
-      _logger.debug('audio.playback_stopped');
+      _logger.debug('audio.playback_stopped', data: {
+        'cleared_queue_chunks': _audioQueue.length,
+      });
     } catch (e) {
       _setupComplete = false;
       _logger.warn('audio.playback_stop_failed', data: {'error': e.toString()});
@@ -529,6 +578,9 @@ class _NativePlayback implements IAudioPlayback {
     }
 
     try {
+      _audioQueue.clear();
+      _drainInProgress = false;
+
       await FlutterPcmSound.stop();
       _setupInitiated = false;
       _setupComplete = false;

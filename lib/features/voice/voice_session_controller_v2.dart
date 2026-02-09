@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -96,7 +97,7 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
 
   // Timers
   Timer? _sendLoopTimer; // Send audio every 10ms
-  Timer? _playbackDrainTimer; // Drain playback buffer every 20ms
+  PlaybackClock? _playbackClock; // Clock-driven playback loop
   Timer? _serverReadyTimer;
   Timer? _silenceDetectionTimer; // Detect silence and send turnComplete
   Timer? _assistantDoneTimer; // Return UI to idle after assistant finishes
@@ -141,7 +142,11 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
 
   // Audio playback state machine - driven ONLY by incoming audio chunks
   AudioPlaybackState _audioPlaybackState = AudioPlaybackState.idle;
-  static const Duration _audioSilenceTimeout = Duration(milliseconds: 10000);
+  DateTime? _playbackClockStart;
+  int _playbackFramesSent = 0;
+  int _playbackTicks = 0;
+  bool _audioEndReceived = false;
+  static const Duration _audioSilenceTimeout = Duration(milliseconds: 3000);
 
   // Enforce monotonic created_at for message ordering
   DateTime? _lastMessageTimestamp;
@@ -309,7 +314,7 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
 
       // Send turnComplete to Vertex to end the turn
       if (!_turnCompleteAlreadySent && gateway.isConnected && _serverReady) {
-        unawaited(gateway.sendTurnComplete());
+        unawaited(gateway.sendTurnComplete(transcribeOnly: true));
         _turnCompleteAlreadySent = true;
         logger.info('voice.turn_complete_sent_on_mic_stop');
       }
@@ -481,7 +486,7 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
         });
 
         if (gateway.isConnected && _serverReady) {
-          unawaited(gateway.sendTurnComplete());
+          unawaited(gateway.sendTurnComplete(transcribeOnly: true));
           _turnCompleteAlreadySent = true;
           _silenceDetectionTimer?.cancel();
         }
@@ -571,15 +576,17 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
   }
 
   void _startPlaybackDrainLoop() {
-    _playbackDrainTimer?.cancel();
+    _playbackClock?.stop();
     logger.info('voice.playback_drain_starting');
 
-    _playbackDrainTimer = Timer.periodic(const Duration(milliseconds: 20), (_) {
-      if (!_sessionActive) return;
-      // Don't block on _serverReady - let audio drain smoothly
-
-      _drainPlaybackBuffer();
-    });
+    _playbackClock = PlaybackClock(
+      frameSamples: PlaybackBufferManager.frameSamples,
+      sampleRate: PlaybackBufferManager.sampleRate,
+      onTick: () {
+        if (!_sessionActive) return;
+        _drainPlaybackBuffer();
+      },
+    )..start();
   }
 
   void _drainPlaybackBuffer() {
@@ -590,66 +597,96 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
 
     if (_aiMuted) {
       // Only log occasionally to avoid spam
-      if (_playbackBuffer.bufferDepthFrames > 0) {
+      if (_playbackBuffer.bufferedSamples > 0) {
         logger.debug('voice.playback_drain_skipped_muted', data: {
-          'buffer_frames': _playbackBuffer.bufferDepthFrames,
+          'buffer_level_ms': _playbackBuffer.bufferedMs,
         });
       }
       return;
     }
 
     try {
-      final prebuffering = _playbackBuffer.isPrebuffering;
-      final bufferFrames = _playbackBuffer.bufferDepthFrames;
-
-      // Log prebuffering status (every 5 calls to avoid spam)
-      if (prebuffering && bufferFrames % 5 == 0) {
-        logger.debug('voice.playback_prebuffering', data: {
-          'buffer_frames': bufferFrames,
-          'buffer_ms': _playbackBuffer.bufferDepthMs,
-          'target_frames':
-              2, // 40ms prebuffer (reduced from 120ms for lower latency)
+      _playbackTicks += 1;
+      if (_playbackTicks % 50 == 0) {
+        logger.debug('voice.playback_tick', data: {
+          'buffer_level_ms': _playbackBuffer.bufferedMs,
+          'buffered_samples': _playbackBuffer.bufferedSamples,
         });
       }
 
-      final frames = _playbackBuffer.drainFrames();
+      final bufferedMs = _playbackBuffer.bufferedMs;
 
-      if (frames.isEmpty) {
-        if (prebuffering && bufferFrames > 0) {
-          // Still prebuffering - log every 10 cycles to avoid spam
-          if (bufferFrames % 10 == 0) {
-            logger.debug('voice.playback_prebuffering_status', data: {
-              'buffer_frames': bufferFrames,
-              'buffer_ms': _playbackBuffer.bufferDepthMs,
+      if (!_playbackBuffer.isPlaybackInitialized) {
+        if (_playbackBuffer.isPrebuffering) {
+          if (bufferedMs > 0 && bufferedMs % 100 == 0) {
+            logger.info('voice.playback_prebuffering', data: {
+              'buffer_level_ms': bufferedMs,
+              'buffered_samples': _playbackBuffer.bufferedSamples,
             });
           }
+        }
+
+        if (_playbackBuffer.canStartPlayback) {
+          _playbackBuffer.markPlaybackStarted();
+          _playbackClockStart = DateTime.now();
+          _playbackFramesSent = 0;
+          unawaited(audio.playback.setup().then((_) {
+            logger.info('voice.playback_started', data: {
+              'buffer_level_ms': bufferedMs,
+              'buffered_samples': _playbackBuffer.bufferedSamples,
+            });
+          }).catchError((e) {
+            logger.error('voice.playback_setup_failed', error: e);
+          }));
         }
         return;
       }
 
-      // Successfully drained frames!
-      logger.debug('voice.playback_draining', data: {
-        'frame_count': frames.length,
-        'buffer_depth_ms': _playbackBuffer.bufferDepthMs,
-        'total_bytes': frames.fold<int>(0, (sum, f) => sum + f.data.length),
-      });
-
-      // Feed all frames to playback engine WITHOUT awaiting to prevent blocking
-      int bytesFed = 0;
-      for (final frame in frames) {
-        // Fire-and-forget: don't await feed() to prevent blocking the drain loop
-        // This allows the next iteration to happen quickly
-        audio.playback.feed(frame.data).catchError((feedError) {
-          logger.error('voice.playback_feed_failed', error: feedError);
-          // Continue to next frame
+      if (_audioEndReceived && _playbackBuffer.bufferedSamples == 0) {
+        logger.info('voice.playback_stopped', data: {
+          'reason': 'audio_end',
         });
-        bytesFed += frame.data.length;
+        _finalizePlayback();
+        return;
       }
 
-      logger.debug('voice.playback_drained', data: {
-        'frame_count': frames.length,
-        'total_bytes_fed': bytesFed,
+      final pull = _playbackBuffer.pullFrame();
+      if (pull.usedSilence) {
+        logger.info('voice.playback_underrun_prevented', data: {
+          'buffered_samples': _playbackBuffer.bufferedSamples,
+          'padded_samples': pull.paddedSamples,
+        });
+        logger.info('voice.silence_padded_samples', data: {
+          'padded_samples': pull.paddedSamples,
+        });
+      }
+
+      logger.debug('voice.playback_feed', data: {
+        'chunk_bytes': pull.data.length,
+        'buffer_level_ms': _playbackBuffer.bufferedMs,
+        'buffered_samples': _playbackBuffer.bufferedSamples,
       });
+
+      audio.playback.feed(pull.data).catchError((feedError) {
+        logger.error('voice.playback_feed_failed', error: feedError);
+      });
+
+      logger.debug('voice.audio_track_write', data: {
+        'chunk_bytes': pull.data.length,
+        'buffer_level_ms': _playbackBuffer.bufferedMs,
+      });
+
+      _playbackFramesSent += 1;
+      if (_playbackClockStart != null && _playbackFramesSent % 50 == 0) {
+        final expectedMs = _playbackFramesSent * PlaybackBufferManager.frameMs;
+        final actualMs =
+            DateTime.now().difference(_playbackClockStart!).inMilliseconds;
+        logger.debug('voice.playback_clock_drift', data: {
+          'expected_ms': expectedMs,
+          'actual_ms': actualMs,
+          'drift_ms': actualMs - expectedMs,
+        });
+      }
     } catch (e) {
       logger.error('voice.playback_drain_failed', error: e);
     }
@@ -672,10 +709,17 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
       logger.debug('voice.playback_state_changed', data: {'state': 'playing'});
     }
 
-    // Schedule finalization after silence timeout
-    _audioStopTimer = Timer(_audioSilenceTimeout, () {
+    final bufferedMs = _playbackBuffer.bufferedMs;
+    final timeoutMs = math.max(
+      _audioSilenceTimeout.inMilliseconds,
+      bufferedMs + 1000,
+    );
+
+    // Schedule finalization after silence timeout (scaled for buffered audio)
+    _audioStopTimer = Timer(Duration(milliseconds: timeoutMs), () {
       logger.info('voice.audio_silence_detected', data: {
-        'timeout_ms': _audioSilenceTimeout.inMilliseconds,
+        'timeout_ms': timeoutMs,
+        'buffered_ms': bufferedMs,
       });
       _finalizePlayback();
     });
@@ -696,7 +740,9 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
     _audioPlaybackState = AudioPlaybackState.finishing;
 
     // Clear playback buffer
-    _playbackBuffer.clear();
+    _playbackBuffer.resetForTurn();
+    _playbackClockStart = null;
+    _playbackFramesSent = 0;
 
     // Reset audio chunk counter for next turn
     receivedAudioChunks = 0;
@@ -704,7 +750,7 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
     // Stop audio output
     try {
       audio.playback.stop();
-      logger.debug('voice.playback_stopped');
+      logger.info('voice.playback_stopped');
     } catch (e) {
       logger
           .debug('voice.playback_stop_ignored', data: {'error': e.toString()});
@@ -757,8 +803,13 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
         final state = ev.payload['state'] as String?;
 
         if (state == 'thinking') {
-          _setState(VoiceUiState.thinking);
-          logger.info('voice.server_thinking');
+          // Ignore late thinking updates once we are already speaking
+          if (_uiState != VoiceUiState.speaking) {
+            _setState(VoiceUiState.thinking);
+            logger.info('voice.server_thinking');
+          } else {
+            logger.debug('voice.server_thinking_ignored_while_speaking');
+          }
         } else if (state == 'ready') {
           _serverReady = true;
           _serverReadyTimer?.cancel();
@@ -772,6 +823,19 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
         }
         break;
 
+      case gw.GatewayEventType.audioStart:
+        _audioEndReceived = false;
+        _playbackBuffer.resetForTurn();
+        receivedAudioChunks = 0;
+        logger.info('voice.audio_start');
+        break;
+
+      case gw.GatewayEventType.audioEnd:
+        _audioEndReceived = true;
+        logger.info('voice.audio_end');
+        break;
+
+      case gw.GatewayEventType.audioChunk:
       case gw.GatewayEventType.audioOut:
         if (_aiMuted) {
           logger.info('voice.ai_audio_muted_skipped');
@@ -785,24 +849,27 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
         }
         try {
           final audioBytes = base64Decode(b64);
-          _playbackBuffer.enqueueAiAudio(Uint8List.fromList(audioBytes));
+          final droppedBytes =
+              _playbackBuffer.enqueueAiAudio(Uint8List.fromList(audioBytes));
+
+          if (droppedBytes > 0) {
+            logger.warn('voice.playback_buffer_drop', data: {
+              'dropped_bytes': droppedBytes,
+              'buffer_level_ms': _playbackBuffer.bufferedMs,
+              'buffered_samples': _playbackBuffer.bufferedSamples,
+            });
+          }
+
+          if (receivedAudioChunks % 10 == 0) {
+            logger.info('voice.audio_chunk_received', data: {
+              'chunk_count': receivedAudioChunks,
+              'buffer_level_ms': _playbackBuffer.bufferedMs,
+              'buffered_samples': _playbackBuffer.bufferedSamples,
+            });
+          }
 
           // Track last audio received time for metrics
           _lastAiAudioReceivedTime = DateTime.now();
-
-          // === CRITICAL: Re-setup audio engine on FIRST chunk after finalization ===
-          // After previous turn ends, audio engine is cleaned up.
-          // When first audio chunk arrives, re-initialize it for next turn.
-          if (_audioPlaybackState == AudioPlaybackState.idle &&
-              receivedAudioChunks == 1) {
-            unawaited(audio.playback.setup().then((_) {
-              logger.debug('voice.playback_reinitialized_for_new_turn');
-            }).catchError((e) {
-              logger.warn('voice.playback_reinit_failed', data: {
-                'error': e.toString(),
-              });
-            }));
-          }
 
           // === CRITICAL: Reset silence timer on EVERY audio chunk ===
           // This is the ONLY driver of playback lifecycle.
@@ -810,16 +877,19 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
           // transcriptFinal events do NOT affect playback.
           _resetSilenceTimer();
 
-          // Transition to speaking state when first audio chunk arrives
+          // === CRITICAL: Force transition to speaking on FIRST audio/text ===
+          // REQUIREMENT: Thinking animation MUST NOT be visible once response starts
+          // This prevents THINKING + SPEAKING overlap
           if (_uiState == VoiceUiState.thinking) {
             _setState(VoiceUiState.speaking);
-            logger.info('voice.state_transition_thinking_to_speaking');
+            logger.info(
+                'voice.state_transition_thinking_to_speaking_audio_triggered');
           }
 
           logger.info('voice.ai_audio_received', data: {
             'size_bytes': audioBytes.length,
-            'buffer_depth_ms': _playbackBuffer.bufferDepthMs,
-            'buffer_frames': _playbackBuffer.bufferDepthFrames,
+            'buffer_level_ms': _playbackBuffer.bufferedMs,
+            'buffered_samples': _playbackBuffer.bufferedSamples,
             'is_prebuffering': _playbackBuffer.isPrebuffering,
             'session_active': _sessionActive,
             'ai_muted': _aiMuted,
@@ -836,6 +906,10 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
           'playback_state': _audioPlaybackState.toString(),
         });
         _finalizePlayback();
+        if (_uiState == VoiceUiState.thinking) {
+          _setState(VoiceUiState.idle);
+          logger.info('voice.state_transition_thinking_to_idle_audio_stop');
+        }
         break;
 
       case gw.GatewayEventType.userTranscriptPartial:
@@ -866,11 +940,15 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
       case gw.GatewayEventType.transcriptPartial:
         assistantTextPartial = ev.payload['text'] as String? ?? '';
 
-        // Transition to speaking when assistant starts generating text
+        // === CRITICAL: Force transition to speaking on FIRST text (fallback if audio delayed) ===
+        // REQUIREMENT: Thinking animation MUST NOT be visible once response starts
+        // This ensures thinking stops even if text arrives before audio
         if (assistantTextPartial.isNotEmpty &&
             (_uiState == VoiceUiState.thinking ||
                 _uiState == VoiceUiState.idle)) {
           _setState(VoiceUiState.speaking);
+          logger.info(
+              'voice.state_transition_thinking_to_speaking_text_triggered');
         }
 
         logger.debug('voice.assistant_transcript_partial', data: {
@@ -890,6 +968,17 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
               0, math.min(50, assistantTextFinal.length)),
         });
         _textTurnInFlight = false;
+
+        // If text arrives without audio, stop thinking and return to idle.
+        final noAudioReceived = receivedAudioChunks == 0 &&
+            _audioPlaybackState == AudioPlaybackState.idle &&
+            _playbackBuffer.bufferedSamples == 0;
+        if (assistantTextFinal.isNotEmpty &&
+            _uiState == VoiceUiState.thinking &&
+            noAudioReceived) {
+          _setState(VoiceUiState.idle);
+          logger.info('voice.state_transition_thinking_to_idle_text_only');
+        }
 
         // === CRITICAL: transcriptFinal does NOT affect audio playback ===
         // Text completion != Audio completion
@@ -982,7 +1071,8 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
 
     // Stop timers
     _sendLoopTimer?.cancel();
-    _playbackDrainTimer?.cancel();
+    _playbackClock?.stop();
+    _playbackClock = null;
     _serverReadyTimer?.cancel();
     _reconnectTimer?.cancel();
     _silenceDetectionTimer?.cancel();
@@ -1057,10 +1147,7 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
       _messageStreamSub = _conversationRepo
           .streamMessages(_activeConversation!.id)
           .listen((messages) {
-        _messages
-          ..clear()
-          ..addAll(messages);
-        notifyListeners();
+        _mergeMessagesFromStream(messages);
       });
 
       logger.info('voice.conversation_initialized', data: {
@@ -1351,7 +1438,7 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
       logger.info('voice.ai_muted');
     } else {
       // Unmuting: reset buffer state so it can start fresh
-      _playbackBuffer.resetPlaybackStart();
+      _playbackBuffer.resetForTurn();
       logger.info('voice.ai_unmuted');
     }
     notifyListeners();
@@ -1453,6 +1540,28 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _mergeMessagesFromStream(List<ChatMessage> incoming) {
+    if (incoming.isEmpty) {
+      return;
+    }
+
+    final mergedById = <String, ChatMessage>{
+      for (final message in _messages) message.id: message,
+    };
+
+    for (final message in incoming) {
+      mergedById[message.id] = message;
+    }
+
+    final merged = mergedById.values.toList()
+      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+
+    _messages
+      ..clear()
+      ..addAll(merged);
+    notifyListeners();
+  }
+
   /// Update message content (e.g., user edits transcript)
   Future<void> updateMessageContent({
     required String messageId,
@@ -1517,4 +1626,81 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
     _cleanup();
     super.dispose();
   }
+}
+
+class PlaybackClock {
+  final int frameSamples;
+  final int sampleRate;
+  final VoidCallback onTick;
+
+  Isolate? _isolate;
+  ReceivePort? _receivePort;
+  StreamSubscription? _subscription;
+  SendPort? _controlPort;
+
+  PlaybackClock({
+    required this.frameSamples,
+    required this.sampleRate,
+    required this.onTick,
+  });
+
+  void start() {
+    stop();
+    _receivePort = ReceivePort();
+    _subscription = _receivePort!.listen((message) {
+      if (message is SendPort) {
+        _controlPort = message;
+        return;
+      }
+      if (message == _ClockMessage.tick) {
+        onTick();
+      }
+    });
+
+    Isolate.spawn(_clockIsolate, [
+      _receivePort!.sendPort,
+      frameSamples,
+      sampleRate,
+    ]).then((iso) {
+      _isolate = iso;
+    });
+  }
+
+  void stop() {
+    _controlPort?.send(_ClockMessage.stop);
+    _subscription?.cancel();
+    _subscription = null;
+    _receivePort?.close();
+    _receivePort = null;
+    _isolate?.kill(priority: Isolate.immediate);
+    _isolate = null;
+    _controlPort = null;
+  }
+
+  static void _clockIsolate(List<dynamic> args) {
+    final SendPort sendPort = args[0] as SendPort;
+    final int frameSamples = args[1] as int;
+    final int sampleRate = args[2] as int;
+    final controlPort = ReceivePort();
+
+    sendPort.send(controlPort.sendPort);
+
+    final frameDurationUs = (frameSamples * 1000000 / sampleRate).round();
+    final timer = Timer.periodic(
+      Duration(microseconds: frameDurationUs),
+      (_) => sendPort.send(_ClockMessage.tick),
+    );
+
+    controlPort.listen((message) {
+      if (message == _ClockMessage.stop) {
+        timer.cancel();
+        controlPort.close();
+      }
+    });
+  }
+}
+
+class _ClockMessage {
+  static const String tick = 'tick';
+  static const String stop = 'stop';
 }

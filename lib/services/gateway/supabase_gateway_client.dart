@@ -93,7 +93,7 @@ class SupabaseGatewayClient implements IGatewayClient {
   }
 
   @override
-  Future<void> sendTurnComplete() async {
+  Future<void> sendTurnComplete({bool transcribeOnly = false}) async {
     _ensureConnected();
 
     if (_turnInFlight) {
@@ -343,6 +343,13 @@ class SupabaseGatewayClient implements IGatewayClient {
         }
 
         // DON'T send audioStop - let silence timer handle completion
+      } else if (responseText.isNotEmpty) {
+        // Text-only response: notify playback lifecycle to exit thinking state
+        _emit(GatewayEvent(
+          type: GatewayEventType.audioStop,
+          payload: {'reason': 'text_only'},
+          seq: _nextSeq(),
+        ));
       }
 
       _emit(GatewayEvent(
@@ -404,14 +411,19 @@ class SupabaseGatewayClient implements IGatewayClient {
       return [];
     }
 
-    // Base64 encoding increases size by ~33% (4 chars per 3 bytes)
-    // So we need 4/3 more base64 characters to cover chunkSizeBytes
-    final chunkSizeB64 = ((chunkSizeBytes * 4) / 3).ceil();
+    // Decode to raw bytes and re-encode per chunk to keep valid base64.
+    // Splitting base64 strings directly can create invalid padding.
+    Uint8List bytes;
+    try {
+      bytes = base64Decode(audioB64);
+    } catch (_) {
+      return [audioB64];
+    }
 
     final chunks = <String>[];
-    for (int i = 0; i < audioB64.length; i += chunkSizeB64) {
-      final end = (i + chunkSizeB64).clamp(0, audioB64.length);
-      chunks.add(audioB64.substring(i, end));
+    for (int i = 0; i < bytes.length; i += chunkSizeBytes) {
+      final end = (i + chunkSizeBytes).clamp(0, bytes.length);
+      chunks.add(base64Encode(bytes.sublist(i, end)));
     }
 
     return chunks.isNotEmpty ? chunks : [audioB64];

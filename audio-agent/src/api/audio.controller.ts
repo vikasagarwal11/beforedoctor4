@@ -1,6 +1,5 @@
 import type { FastifyInstance } from "fastify";
 import type { AudioPipelineLike } from "../pipeline/audio.pipeline.js";
-import { extractPcmFromWav } from "../utils/audio.utils.js";
 import { badRequest } from "../utils/errors.js";
 
 export async function registerAudioRoutes(app: FastifyInstance, pipeline: AudioPipelineLike) {
@@ -17,17 +16,8 @@ export async function registerAudioRoutes(app: FastifyInstance, pipeline: AudioP
 
     const result = await pipeline.handleTurn(bytes, sessionId);
     
-    // Convert WAV to PCM for Flutter playback
-    let audioPcmB64 = "";
-    if (result.response_audio_wav_b64) {
-      try {
-        const wavBuffer = Buffer.from(result.response_audio_wav_b64, "base64");
-        const pcmBuffer = extractPcmFromWav(wavBuffer);
-        audioPcmB64 = pcmBuffer.toString("base64");
-      } catch (err) {
-        app.log.warn({ error: String(err) }, "Failed to extract PCM from WAV, returning empty audio");
-      }
-    }
+    // PCM is already returned by the TTS worker
+    const audioPcmB64 = result.response_audio_pcm_b64 || "";
     
     app.log.info({
       transcriptTextLength: result.transcript_text.length,
@@ -72,22 +62,8 @@ export async function registerAudioRoutes(app: FastifyInstance, pipeline: AudioP
     
     const result = await pipeline.handleTextTurn(text, sessionId);
     
-    // Convert WAV to PCM for Flutter playback
-    let audioPcmB64 = "";
-    if (result.response_audio_wav_b64) {
-      try {
-        const wavBuffer = Buffer.from(result.response_audio_wav_b64, "base64");
-        console.log(`[AUDIO_CONTROLLER] WAV buffer size: ${wavBuffer.length}`);
-        console.log(`[AUDIO_CONTROLLER] WAV header (first 12 bytes): ${wavBuffer.toString('hex', 0, 12)}`);
-        const pcmBuffer = extractPcmFromWav(wavBuffer);
-        console.log(`[AUDIO_CONTROLLER] Extracted PCM size: ${pcmBuffer.length}`);
-        console.log(`[AUDIO_CONTROLLER] PCM data (first 20 bytes): ${pcmBuffer.toString('hex', 0, 20)}`);
-        audioPcmB64 = pcmBuffer.toString("base64");
-      } catch (err) {
-        console.error(`[AUDIO_CONTROLLER] WAV extraction failed: ${err}`);
-        app.log.warn({ error: String(err) }, "Failed to extract PCM from WAV, returning empty audio");
-      }
-    }
+    // PCM is already returned by the TTS worker
+    const audioPcmB64 = result.response_audio_pcm_b64 || "";
     
     app.log.info({
       responseTextLength: result.response_text.length,

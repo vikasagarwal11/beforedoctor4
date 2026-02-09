@@ -20,6 +20,9 @@ enum GatewayEventType {
   transcriptFinal, // server.transcript.final
   narrativeUpdate, // server.narrative.update  (string or patch)
   aeDraftUpdate, // server.ae_draft.update   (json patch)
+  audioStart, // server.audio.start
+  audioChunk, // server.audio.chunk
+  audioEnd, // server.audio.end
   audioOut, // server.audio.out        (base64 pcm24k s16le)
   audioStop, // server.audio.stop       (barge-in / flush playback)
   emergency, // server.triage.emergency
@@ -76,6 +79,12 @@ class GatewayEvent {
         return GatewayEventType.narrativeUpdate;
       case 'server.ae_draft.update':
         return GatewayEventType.aeDraftUpdate;
+      case 'server.audio.start':
+        return GatewayEventType.audioStart;
+      case 'server.audio.chunk':
+        return GatewayEventType.audioChunk;
+      case 'server.audio.end':
+        return GatewayEventType.audioEnd;
       case 'server.audio.out':
         return GatewayEventType.audioOut;
       case 'server.audio.stop':
@@ -138,8 +147,12 @@ String clientStop() {
 }
 
 /// Signal end of user utterance (turnComplete: true)
-String clientTurnComplete() {
-  return jsonEncode({'type': 'client.audio.turnComplete', 'payload': {}});
+String clientTurnComplete({bool transcribeOnly = false}) {
+  final payload = <String, dynamic>{};
+  if (transcribeOnly) {
+    payload['transcribe_only'] = true;
+  }
+  return jsonEncode({'type': 'client.audio.turnComplete', 'payload': payload});
 }
 
 /// Send a text turn (e.g., edited transcript) to the gateway.

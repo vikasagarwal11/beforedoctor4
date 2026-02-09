@@ -30,7 +30,7 @@ abstract class IGatewayClient {
   Future<void> sendAudioChunkBase64(String base64Pcm16k);
   Future<void> sendAudioChunkBinary(
       Uint8List pcm16k); // Binary WebSocket frames
-  Future<void> sendTurnComplete();
+  Future<void> sendTurnComplete({bool transcribeOnly = false});
   Future<void> sendTextTurn(String text, {String? conversationId});
   Future<void> sendBargeIn(); // Cancel server-side audio generation
   Future<void> sendStop();
@@ -43,6 +43,7 @@ class GatewayClient implements IGatewayClient {
   bool _connected = false;
   int _connectionSeq = 0;
   bool _intentionalClose = false;
+  Timer? _pingTimer;
 
   @override
   Stream<GatewayEvent> get events => _controller.stream;
@@ -99,6 +100,8 @@ class GatewayClient implements IGatewayClient {
       onDone: () {
         if (conn != _connectionSeq) return;
         _connected = false;
+        _pingTimer?.cancel();
+        _pingTimer = null;
 
         // Only surface a disconnect if it wasn't a user/system initiated close.
         if (!_intentionalClose) {
@@ -120,6 +123,13 @@ class GatewayClient implements IGatewayClient {
       sessionConfig: sessionConfig,
       conversationId: conversationId,
     ));
+
+    // Keepalive ping to prevent idle disconnects (ngrok/mobile)
+    _pingTimer?.cancel();
+    _pingTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+      if (_channel == null || !_connected) return;
+      _channel!.sink.add(jsonEncode({'type': 'client.ping', 'payload': {}}));
+    });
   }
 
   @override
@@ -140,11 +150,11 @@ class GatewayClient implements IGatewayClient {
   }
 
   @override
-  Future<void> sendTurnComplete() async {
+  Future<void> sendTurnComplete({bool transcribeOnly = false}) async {
     if (_channel == null || !_connected) {
       throw StateError('Gateway not connected');
     }
-    _channel!.sink.add(clientTurnComplete());
+    _channel!.sink.add(clientTurnComplete(transcribeOnly: transcribeOnly));
   }
 
   @override
@@ -178,6 +188,8 @@ class GatewayClient implements IGatewayClient {
     _intentionalClose = true;
     _connectionSeq++;
     _connected = false;
+    _pingTimer?.cancel();
+    _pingTimer = null;
     await _channel?.sink.close();
     _channel = null;
   }

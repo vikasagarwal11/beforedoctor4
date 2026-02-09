@@ -134,9 +134,12 @@ class _AppShellState extends State<AppShell> {
         final mq = MediaQuery.of(context);
 
         // Backend selection
-        // The app now uses Supabase (Edge Functions) as the backend for voice turns.
-        // Gateway/WebSocket configuration is intentionally disabled in the frontend.
+        // WebSocket gateway for real-time audio streaming.
         const useMockGateway = false; // Set true for UI-only testing
+        final voiceGatewayUrl = Uri.parse(const String.fromEnvironment(
+          'VOICE_GATEWAY_URL',
+          defaultValue: 'ws://10.0.2.2:8089/v1/audio/stream',
+        ));
 
         final pages = [
           HomeScreen(
@@ -145,9 +148,7 @@ class _AppShellState extends State<AppShell> {
               onProfileChange: _setProfile),
           // Use VoiceLiveScreenV2 (new Gemini Live-style UI)
           VoiceLiveScreenV2(
-            // Kept for backward compatibility with the screen/controller signature.
-            // Not used when SupabaseGatewayClient is active.
-            gatewayUrl: Uri.parse('ws://unused.local'),
+            gatewayUrl: voiceGatewayUrl,
             // Use Supabase access token (replaces Firebase ID token)
             firebaseIdToken:
                 _supabaseAccessToken, // Uses same parameter name for backward compatibility

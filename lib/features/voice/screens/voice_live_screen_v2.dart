@@ -8,8 +8,8 @@ import 'package:share_plus/share_plus.dart';
 import '../../../core/constants/tokens.dart';
 import '../../../services/audio/native_audio_engine.dart';
 import '../../../services/audio/vad_processor.dart';
+import '../../../services/gateway/gateway_client.dart';
 import '../../../services/gateway/mock_gateway_client.dart';
-import '../../../services/gateway/supabase_gateway_client.dart';
 import '../../../services/logging/app_logger.dart';
 import '../voice_session_controller_v2.dart';
 import '../widgets/chat_message_list.dart';
@@ -53,7 +53,7 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
 
     // Initialize controller
     final gateway =
-        widget.useMockGateway ? MockGatewayClient() : SupabaseGatewayClient();
+      widget.useMockGateway ? MockGatewayClient() : GatewayClient();
     final audio = NativeAudioEngine();
 
     _controller = VoiceSessionControllerV2(
