@@ -461,8 +461,16 @@ class _NativePlayback implements IAudioPlayback {
       _logger.warn('audio.feed_before_setup', data: {
         'setup_initiated': _setupInitiated,
         'setup_complete': _setupComplete,
+        'chunk_size': pcm24k.length,
       });
-      await setup();
+
+      // Try to auto-recover by calling setup
+      try {
+        await setup();
+      } catch (setupError) {
+        _logger.error('audio.feed_auto_setup_failed', error: setupError);
+        return;
+      }
     }
 
     try {
@@ -474,9 +482,14 @@ class _NativePlayback implements IAudioPlayback {
       // Convert Uint8List to ByteData for PcmArrayInt16
       final byteData =
           pcm24k.buffer.asByteData(pcm24k.offsetInBytes, pcm24k.length);
+
+      // Feed to FlutterPcmSound - don't log every chunk to avoid spam
       await FlutterPcmSound.feed(PcmArrayInt16(bytes: byteData));
     } catch (e) {
-      _logger.warn('audio.playback_feed_failed', data: {'error': e.toString()});
+      _logger.error('audio.playback_feed_failed', error: e, data: {
+        'chunk_size': pcm24k.length,
+      });
+      // Don't rethrow - allow the drain loop to continue
     }
   }
 

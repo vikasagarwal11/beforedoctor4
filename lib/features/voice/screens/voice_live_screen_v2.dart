@@ -8,7 +8,8 @@ import 'package:share_plus/share_plus.dart';
 import '../../../core/constants/tokens.dart';
 import '../../../services/audio/native_audio_engine.dart';
 import '../../../services/audio/vad_processor.dart';
-import '../../../services/gateway/gateway_client.dart';
+import '../../../services/gateway/mock_gateway_client.dart';
+import '../../../services/gateway/supabase_gateway_client.dart';
 import '../../../services/logging/app_logger.dart';
 import '../voice_session_controller_v2.dart';
 import '../widgets/chat_message_list.dart';
@@ -51,7 +52,8 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
     )..repeat(reverse: true);
 
     // Initialize controller
-    final gateway = GatewayClient();
+    final gateway =
+        widget.useMockGateway ? MockGatewayClient() : SupabaseGatewayClient();
     final audio = NativeAudioEngine();
 
     _controller = VoiceSessionControllerV2(
@@ -64,8 +66,12 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
 
     // Sync voice transcript to text field (never override while user edits)
     _controller.addListener(() {
-      // Do not overwrite text if user is editing
-      if (_textFocusNode.hasFocus) {
+      // Do not overwrite if user is actively editing non-empty text.
+      if (_textFocusNode.hasFocus && _textController.text.trim().isNotEmpty) {
+        _logger.debug('voice.transcript_update_blocked_user_editing', data: {
+          'has_focus': _textFocusNode.hasFocus,
+          'text_length': _textController.text.length,
+        });
         return;
       }
 
@@ -87,6 +93,10 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
 
       // Only sync if text is different
       if (displayText != _textController.text) {
+        _logger.debug('voice.text_field_sync', data: {
+          'display_text_length': displayText.length,
+          'previous_length': _textController.text.length,
+        });
         _updatingFromController = true; // Prevent onChanged from firing
         _textController.text = displayText;
         _textController.selection = TextSelection.collapsed(
@@ -292,287 +302,176 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
     }
 
     return Scaffold(
-      extendBodyBehindAppBar: true,
       appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        title: const Text('Live Voice'),
+        title: const Text('Chat'),
         actions: [
           IconButton(
-            tooltip: 'Debug',
-            onPressed: _showDebugSheet,
-            icon: const Icon(Icons.tune_rounded),
-          ),
-        ],
-      ),
-      body: Stack(
-        children: [
-          _BackgroundGlow(
-              color: _statusColor(context), animation: _auraController),
-          SafeArea(
-            child: Padding(
-              padding: EdgeInsets.zero,
-              child: Column(
-                children: [
-                  // Modern gradient header with glass effect
-                  Container(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                        colors: [
-                          const Color(0xFF6366F1), // Indigo
-                          const Color(0xFF8B5CF6), // Purple
-                        ],
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: const Color(0xFF6366F1).withOpacity(0.3),
-                          blurRadius: 20,
-                          offset: const Offset(0, 4),
-                        ),
-                      ],
-                    ),
-                    child: SafeArea(
-                      bottom: false,
-                      child: Padding(
-                        padding: const EdgeInsets.all(AppTokens.lg),
-                        child: Row(
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: Colors.white.withOpacity(0.2),
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              child: const Icon(
-                                Icons.medical_services_outlined,
-                                color: Colors.white,
-                                size: 28,
-                              ),
-                            ),
-                            const SizedBox(width: AppTokens.md),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    'BeforeDoctor AI',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .titleLarge
-                                        ?.copyWith(
-                                          color: Colors.white,
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                  ),
-                                  Text(
-                                    _getStatusText(),
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodyMedium
-                                        ?.copyWith(
-                                          color: Colors.white.withOpacity(0.9),
-                                        ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                  // Error banner
-                  _buildErrorBanner(context),
-                  // Modern chat area with gradient
-                  Expanded(
-                    child: Container(
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          begin: Alignment.topCenter,
-                          end: Alignment.bottomCenter,
-                          colors: [
-                            cs.surface,
-                            cs.surfaceContainerLowest,
-                          ],
-                        ),
-                      ),
-                      child: ChatMessageList(
-                        messages: _controller.messages,
-                        userPartialText: null,
-                        userDraftText: null,
-                        userDraftEditing: false,
-                        showDraftPlaceholder: false,
-                        onDraftEditingChanged: null,
-                        onDraftChanged: null,
-                        onDraftSend: null,
-                        assistantPartialText: null,
-                        onMessageEdit: (messageId, newContent) {
-                          _controller.updateMessageContent(
-                            messageId: messageId,
-                            newContent: newContent,
-                          );
-                        },
-                      ),
-                    ),
-                  ),
-                  // Modern bottom bar with floating mic button
-                  Container(
-                    decoration: BoxDecoration(
-                      color: cs.surface,
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.08),
-                          blurRadius: 16,
-                          offset: const Offset(0, -4),
-                        ),
-                      ],
-                    ),
-                    child: SafeArea(
-                      top: false,
-                      child: Padding(
-                        padding: const EdgeInsets.all(AppTokens.md),
-                        child: Row(
-                          children: [
-                            // Text input field
-                            Expanded(
-                              child: Container(
-                                constraints: const BoxConstraints(
-                                  maxHeight: 200,
-                                ),
-                                child: SingleChildScrollView(
-                                  child: Container(
-                                    decoration: BoxDecoration(
-                                      color: cs.surfaceContainerHighest,
-                                      borderRadius: BorderRadius.circular(24),
-                                      border: Border.all(
-                                        color: cs.outline.withOpacity(0.2),
-                                      ),
-                                    ),
-                                    child: TextField(
-                                      controller: _textController,
-                                      focusNode: _textFocusNode,
-                                      maxLines: 6,
-                                      minLines: 1,
-                                      textCapitalization:
-                                          TextCapitalization.sentences,
-                                      onChanged: (text) {
-                                        if (!_updatingFromController) {
-                                          _controller.updateUserDraftText(text);
-                                        }
-                                      },
-                                      style:
-                                          Theme.of(context).textTheme.bodyLarge,
-                                      decoration: InputDecoration(
-                                        hintText: _getInputHint(),
-                                        hintStyle: TextStyle(
-                                            color: cs.onSurfaceVariant
-                                                .withOpacity(0.6)),
-                                        border: InputBorder.none,
-                                        contentPadding:
-                                            const EdgeInsets.symmetric(
-                                          horizontal: AppTokens.lg,
-                                          vertical: AppTokens.md,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: AppTokens.sm),
-                            // Large circular mic/send button
-                            _textController.text.trim().isEmpty
-                                ? GestureDetector(
-                                    onTap: () {
-                                      if (_controller.uiState ==
-                                          VoiceUiState.listening) {
-                                        _stopMicCapture();
-                                      } else {
-                                        _startAudioCapture();
-                                      }
-                                    },
-                                    child: Container(
-                                      width: 56,
-                                      height: 56,
-                                      decoration: BoxDecoration(
-                                        gradient: _controller.uiState ==
-                                                VoiceUiState.listening
-                                            ? const LinearGradient(
-                                                colors: [
-                                                  Color(0xFFEF4444),
-                                                  Color(0xFFDC2626),
-                                                ],
-                                              )
-                                            : const LinearGradient(
-                                                colors: [
-                                                  Color(0xFF6366F1),
-                                                  Color(0xFF8B5CF6),
-                                                ],
-                                              ),
-                                        shape: BoxShape.circle,
-                                        boxShadow: [
-                                          BoxShadow(
-                                            color: (_controller.uiState ==
-                                                        VoiceUiState.listening
-                                                    ? const Color(0xFFEF4444)
-                                                    : const Color(0xFF6366F1))
-                                                .withOpacity(0.4),
-                                            blurRadius: 12,
-                                            offset: const Offset(0, 4),
-                                          ),
-                                        ],
-                                      ),
-                                      child: Icon(
-                                        _controller.uiState ==
-                                                VoiceUiState.listening
-                                            ? Icons.stop_rounded
-                                            : Icons.mic_rounded,
-                                        color: Colors.white,
-                                        size: 28,
-                                      ),
-                                    ),
-                                  )
-                                : GestureDetector(
-                                    onTap: _sendTextMessage,
-                                    child: Container(
-                                      width: 56,
-                                      height: 56,
-                                      decoration: BoxDecoration(
-                                        gradient: const LinearGradient(
-                                          colors: [
-                                            Color(0xFF10B981),
-                                            Color(0xFF059669),
-                                          ],
-                                        ),
-                                        shape: BoxShape.circle,
-                                        boxShadow: [
-                                          BoxShadow(
-                                            color: const Color(0xFF10B981)
-                                                .withOpacity(0.4),
-                                            blurRadius: 12,
-                                            offset: const Offset(0, 4),
-                                          ),
-                                        ],
-                                      ),
-                                      child: const Icon(
-                                        Icons.send_rounded,
-                                        color: Colors.white,
-                                        size: 24,
-                                      ),
-                                    ),
-                                  ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
+            tooltip: _controller.isAiMuted ? 'Unmute' : 'Mute',
+            onPressed: () => _controller.toggleAiMute(),
+            icon: Icon(
+              _controller.isAiMuted
+                  ? Icons.volume_off_rounded
+                  : Icons.volume_up_rounded,
             ),
           ),
         ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            _buildErrorBanner(context),
+            Expanded(
+              child: Container(
+                color: cs.surface,
+                child: ChatMessageList(
+                  messages: _controller.messages,
+                  userPartialText: null,
+                  userDraftText: null,
+                  userDraftEditing: false,
+                  showDraftPlaceholder: false,
+                  onDraftEditingChanged: null,
+                  onDraftChanged: null,
+                  onDraftSend: null,
+                  assistantPartialText: _controller.assistantTextPartial.isEmpty
+                      ? null
+                      : _controller.assistantTextPartial,
+                  showAssistantTyping:
+                      (_controller.uiState == VoiceUiState.thinking ||
+                              _controller.uiState == VoiceUiState.speaking) &&
+                          _controller.assistantTextPartial.isEmpty &&
+                          !_controller.isTranscribingPending,
+                  showUserTyping: _controller.isTranscribingPending,
+                  userTypingLabel: _controller.isTranscribingPending
+                      ? 'Transcribing…'
+                      : null,
+                  assistantTypingLabel: (_controller.uiState ==
+                                  VoiceUiState.thinking ||
+                              _controller.uiState == VoiceUiState.speaking) &&
+                          !_controller.isTranscribingPending
+                      ? 'Thinking…'
+                      : null,
+                  onMessageEdit: (messageId, newContent) {
+                    _controller.updateMessageContent(
+                      messageId: messageId,
+                      newContent: newContent,
+                    );
+                  },
+                ),
+              ),
+            ),
+            Container(
+              decoration: BoxDecoration(
+                color: cs.surface,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.08),
+                    blurRadius: 12,
+                    offset: const Offset(0, -2),
+                  ),
+                ],
+              ),
+              child: SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.all(AppTokens.md),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Container(
+                          constraints: const BoxConstraints(
+                            maxHeight: 200,
+                          ),
+                          child: SingleChildScrollView(
+                            child: Container(
+                              decoration: BoxDecoration(
+                                color: cs.surfaceContainerHighest,
+                                borderRadius: BorderRadius.circular(24),
+                                border: Border.all(
+                                  color: cs.outline.withOpacity(0.2),
+                                ),
+                              ),
+                              child: TextField(
+                                controller: _textController,
+                                focusNode: _textFocusNode,
+                                maxLines: 6,
+                                minLines: 1,
+                                textCapitalization:
+                                    TextCapitalization.sentences,
+                                onChanged: (text) {
+                                  if (!_updatingFromController) {
+                                    _controller.updateUserDraftText(text);
+                                  }
+                                },
+                                style: Theme.of(context).textTheme.bodyLarge,
+                                decoration: InputDecoration(
+                                  hintText: _getInputHint(),
+                                  hintStyle: TextStyle(
+                                      color:
+                                          cs.onSurfaceVariant.withOpacity(0.6)),
+                                  border: InputBorder.none,
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: AppTokens.lg,
+                                    vertical: AppTokens.md,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: AppTokens.sm),
+                      _textController.text.trim().isEmpty
+                          ? GestureDetector(
+                              onTap: () {
+                                if (_controller.uiState ==
+                                    VoiceUiState.listening) {
+                                  _stopMicCapture();
+                                } else {
+                                  _startAudioCapture();
+                                }
+                              },
+                              child: Container(
+                                width: 56,
+                                height: 56,
+                                decoration: BoxDecoration(
+                                  color: _controller.uiState ==
+                                          VoiceUiState.listening
+                                      ? const Color(0xFFEF4444)
+                                      : cs.primary,
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Icon(
+                                  _controller.uiState == VoiceUiState.listening
+                                      ? Icons.stop_rounded
+                                      : Icons.mic_rounded,
+                                  color: Colors.white,
+                                  size: 28,
+                                ),
+                              ),
+                            )
+                          : GestureDetector(
+                              onTap: _sendTextMessage,
+                              child: Container(
+                                width: 56,
+                                height: 56,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF10B981),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: const Icon(
+                                  Icons.send_rounded,
+                                  color: Colors.white,
+                                  size: 24,
+                                ),
+                              ),
+                            ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -767,8 +666,7 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
                 _KeyValueRow(
                     label: 'Audio out chunks',
                     value: _controller.receivedAudioChunks.toString()),
-                _KeyValueRow(
-                    label: 'Gateway', value: widget.gatewayUrl.toString()),
+                const _KeyValueRow(label: 'Backend', value: 'Supabase'),
                 const SizedBox(height: AppTokens.lg),
               ],
             ),
@@ -816,6 +714,11 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
 
     // Send message through controller (this will save it)
     _controller.sendUserDraftMessage();
+
+    // Clear the text field UI
+    _updatingFromController = true;
+    _textController.clear();
+    _updatingFromController = false;
 
     // Clear input field
     _textController.clear();

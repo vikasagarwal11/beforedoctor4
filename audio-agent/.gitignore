@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+
+# Python workers
+workers/**/.venv/
+workers/**/__pycache__/
+workers/**/.python-version
+workers/**/.pytest_cache/
+workers/**/.mypy_cache/

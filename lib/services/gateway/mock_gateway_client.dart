@@ -33,12 +33,14 @@ class MockGatewayClient implements IGatewayClient {
     required Uri url,
     required String firebaseIdToken,
     required Map<String, dynamic> sessionConfig,
+    String? conversationId,
   }) async {
     // url ignored
     _connected = true;
     _logger.info('mock_gateway.connected', data: {
       'url': url.toString(),
       'has_token': firebaseIdToken.isNotEmpty,
+      'conversation_id': conversationId,
     });
 
     _emit(GatewayEventType.sessionState, {'state': 'ready'});

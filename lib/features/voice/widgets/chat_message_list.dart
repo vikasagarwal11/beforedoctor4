@@ -3,6 +3,7 @@
 // Real-time updates, auto-scroll, context-aware display
 
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 
 import '../../../core/constants/tokens.dart';
 import '../../../data/models/conversation.dart';
@@ -18,6 +19,10 @@ class ChatMessageList extends StatefulWidget {
   final ValueChanged<String>? onDraftChanged;
   final VoidCallback? onDraftSend;
   final String? assistantPartialText;
+  final bool showAssistantTyping;
+  final bool showUserTyping;
+  final String? userTypingLabel;
+  final String? assistantTypingLabel;
   final ScrollController? scrollController;
   final Function(String messageId, String newContent)? onMessageEdit;
 
@@ -32,6 +37,10 @@ class ChatMessageList extends StatefulWidget {
     this.onDraftChanged,
     this.onDraftSend,
     this.assistantPartialText,
+    this.showAssistantTyping = false,
+    this.showUserTyping = false,
+    this.userTypingLabel,
+    this.assistantTypingLabel,
     this.scrollController,
     this.onMessageEdit,
   });
@@ -43,6 +52,7 @@ class ChatMessageList extends StatefulWidget {
 class _ChatMessageListState extends State<ChatMessageList> {
   late ScrollController _scrollController;
   bool _autoScroll = true;
+  String? _lastMessageSignature;
 
   @override
   void initState() {
@@ -60,6 +70,22 @@ class _ChatMessageListState extends State<ChatMessageList> {
     super.didUpdateWidget(oldWidget);
 
     if (widget.messages.length != oldWidget.messages.length && _autoScroll) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scrollToBottom(animated: true);
+      });
+    }
+
+    ChatMessage? latest;
+    for (final message in widget.messages) {
+      if (latest == null || message.timestamp.isAfter(latest.timestamp)) {
+        latest = message;
+      }
+    }
+    final signature = latest == null
+        ? null
+        : '${latest.id}:${latest.timestamp.millisecondsSinceEpoch}';
+    if (signature != _lastMessageSignature && _autoScroll) {
+      _lastMessageSignature = signature;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _scrollToBottom(animated: true);
       });
@@ -104,22 +130,41 @@ class _ChatMessageListState extends State<ChatMessageList> {
     final sortedMessages = [...widget.messages]..sort((a, b) {
         final t = a.timestamp.compareTo(b.timestamp);
         if (t != 0) return t;
+
+        // If timestamps are equal, keep user messages before assistant
+        if (a.role != b.role) {
+          if (a.role == MessageRole.user) return -1;
+          if (b.role == MessageRole.user) return 1;
+        }
+
         return a.id.compareTo(b.id);
       });
     final showDraft =
         widget.userDraftText != null || widget.showDraftPlaceholder;
 
+    final showAssistantTyping = widget.showAssistantTyping &&
+        (widget.assistantPartialText == null ||
+            widget.assistantPartialText!.isEmpty);
+
+    final showUserTyping = widget.showUserTyping &&
+        (widget.userPartialText == null || widget.userPartialText!.isEmpty);
+
+    // Show empty state only if there's absolutely nothing to display
     if (sortedMessages.isEmpty &&
         widget.userPartialText == null &&
         !showDraft &&
-        widget.assistantPartialText == null) {
+        widget.assistantPartialText == null &&
+        !showAssistantTyping &&
+        !showUserTyping) {
       return _EmptyState();
     }
 
     final itemCount = sortedMessages.length +
         (showDraft ? 1 : 0) +
         (!showDraft && widget.userPartialText != null ? 1 : 0) +
-        (widget.assistantPartialText != null ? 1 : 0);
+        (widget.assistantPartialText != null ? 1 : 0) +
+        (showAssistantTyping ? 1 : 0) +
+        (showUserTyping ? 1 : 0);
 
     return Stack(
       children: [
@@ -172,6 +217,17 @@ class _ChatMessageListState extends State<ChatMessageList> {
               cursor++;
             }
 
+            if (showUserTyping && index == cursor) {
+              return _TypingIndicatorBubble(
+                isUser: true,
+                label: widget.userTypingLabel,
+              );
+            }
+
+            if (showUserTyping) {
+              cursor++;
+            }
+
             if (widget.assistantPartialText != null && index == cursor) {
               return ChatBubble(
                 message: ChatMessage(
@@ -182,6 +238,17 @@ class _ChatMessageListState extends State<ChatMessageList> {
                   timestamp: DateTime.now(),
                 ),
                 isPartial: true,
+              );
+            }
+
+            if (widget.assistantPartialText != null) {
+              cursor++;
+            }
+
+            if (showAssistantTyping && index == cursor) {
+              return _TypingIndicatorBubble(
+                isUser: false,
+                label: widget.assistantTypingLabel,
               );
             }
 
@@ -207,6 +274,106 @@ class _ChatMessageListState extends State<ChatMessageList> {
       _scrollController.dispose();
     }
     super.dispose();
+  }
+}
+
+class _TypingIndicatorBubble extends StatefulWidget {
+  const _TypingIndicatorBubble({required this.isUser, this.label});
+
+  final bool isUser;
+  final String? label;
+
+  @override
+  State<_TypingIndicatorBubble> createState() => _TypingIndicatorBubbleState();
+}
+
+class _TypingIndicatorBubbleState extends State<_TypingIndicatorBubble>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _animation;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    )..repeat();
+    _animation = Tween<double>(begin: 0, end: 1).animate(_controller);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context).textTheme;
+    final isUser = widget.isUser;
+    return Padding(
+      padding: const EdgeInsets.symmetric(
+        vertical: AppTokens.xs,
+        horizontal: AppTokens.sm,
+      ),
+      child: Align(
+        alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+        child: Container(
+          padding: const EdgeInsets.symmetric(
+            horizontal: AppTokens.md,
+            vertical: AppTokens.sm,
+          ),
+          decoration: BoxDecoration(
+            color: isUser ? const Color(0xFFDCF8C6) : Colors.white,
+            borderRadius: const BorderRadius.only(
+              topLeft: Radius.circular(8),
+              topRight: Radius.circular(8),
+              bottomLeft: Radius.circular(2),
+              bottomRight: Radius.circular(8),
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.08),
+                blurRadius: 3,
+                offset: const Offset(0, 1),
+              ),
+            ],
+          ),
+          child: AnimatedBuilder(
+            animation: _animation,
+            builder: (context, _) {
+              final phase = (_animation.value * 3).floor() % 3;
+              final dots =
+                  List.generate(3, (i) => i <= phase ? '•' : '·').join(' ');
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (widget.label != null && widget.label!.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: Text(
+                        widget.label!,
+                        style: t.labelSmall?.copyWith(
+                          color: Colors.black54,
+                        ),
+                      ),
+                    ),
+                  Text(
+                    dots,
+                    style: t.bodyMedium?.copyWith(
+                      color: Colors.black54,
+                      letterSpacing: 2,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -332,11 +499,16 @@ class _ChatBubbleState extends State<ChatBubble> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: [
-                    Text(
-                      widget.message.content,
-                      style: t.bodyMedium?.copyWith(
-                        color: textColor,
-                        height: 1.3,
+                    MarkdownBody(
+                      data: widget.message.content,
+                      selectable: true,
+                      styleSheet: MarkdownStyleSheet.fromTheme(
+                        Theme.of(context),
+                      ).copyWith(
+                        p: t.bodyMedium?.copyWith(
+                          color: textColor,
+                          height: 1.3,
+                        ),
                       ),
                     ),
                     const SizedBox(height: 2),
@@ -344,7 +516,7 @@ class _ChatBubbleState extends State<ChatBubble> {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Text(
-                          _formatTimestamp(widget.message.timestamp),
+                          _formatMeta(widget.message.timestamp),
                           style: t.labelSmall?.copyWith(
                             color: Colors.black54,
                             fontSize: 11,
@@ -447,18 +619,12 @@ class _ChatBubbleState extends State<ChatBubble> {
     );
   }
 
-  String _formatTimestamp(DateTime timestamp) {
-    final now = DateTime.now();
-    final difference = now.difference(timestamp);
-
-    if (difference.inMinutes < 1) {
-      return 'Just now';
-    } else if (difference.inHours < 1) {
-      return '${difference.inMinutes}m ago';
-    } else if (difference.inDays < 1) {
-      return '${difference.inHours}h ago';
-    }
-    return '${timestamp.hour.toString().padLeft(2, '0')}:${timestamp.minute.toString().padLeft(2, '0')}';
+  String _formatMeta(DateTime timestamp) {
+    final hour = timestamp.hour % 12 == 0 ? 12 : timestamp.hour % 12;
+    final minute = timestamp.minute.toString().padLeft(2, '0');
+    final ampm = timestamp.hour >= 12 ? 'PM' : 'AM';
+    final time = '${hour.toString().padLeft(2, '0')}:$minute $ampm';
+    return time;
   }
 }
 

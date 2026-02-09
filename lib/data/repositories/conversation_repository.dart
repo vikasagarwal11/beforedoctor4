@@ -128,6 +128,8 @@ class ConversationRepository {
     required MessageRole role,
     required String content,
     MessageStatus status = MessageStatus.sent,
+    String? id,
+    DateTime? createdAt,
   }) async {
     try {
       await _ensureAuthenticated();
@@ -136,12 +138,13 @@ class ConversationRepository {
         throw Exception('User not authenticated');
       }
 
+      final now = createdAt ?? DateTime.now();
       final message = ChatMessage(
-        id: _uuid.v4(),
+        id: id ?? _uuid.v4(),
         conversationId: conversationId,
         role: role,
         content: content,
-        timestamp: DateTime.now(),
+        timestamp: now,
         status: status,
       );
 
@@ -202,6 +205,7 @@ class ConversationRepository {
       // Return cache if available
       if (_cachedMessages.isNotEmpty &&
           _cachedMessages.first.conversationId == conversationId) {
+        print('[REPO] Returning cached messages: ${_cachedMessages.length}');
         return List.unmodifiable(_cachedMessages);
       }
 
@@ -212,9 +216,16 @@ class ConversationRepository {
           .eq('conversation_id', conversationId)
           .order('created_at', ascending: true);
 
+      print(
+          '[REPO] Raw response type: ${response.runtimeType}, is list: ${response is List}');
+      if (response is List) {
+        print('[REPO] Response count: ${response.length}');
+      }
+
       final messages =
           (response as List).map((json) => ChatMessage.fromJson(json)).toList();
 
+      print('[REPO] Parsed messages: ${messages.length}');
       // Update cache
       _cachedMessages.clear();
       _cachedMessages.addAll(messages);
@@ -232,6 +243,31 @@ class ConversationRepository {
     // Start with cached/existing messages
     final controller = StreamController<List<ChatMessage>>.broadcast();
 
+    Future<void> attachSubscription() async {
+      // Subscribe to real-time updates
+      final subscription = _client
+          .from('messages')
+          .stream(primaryKey: ['id'])
+          .eq('conversation_id', conversationId)
+          .order('created_at', ascending: true)
+          .listen((List<Map<String, dynamic>> data) {
+            final messages =
+                data.map((json) => ChatMessage.fromJson(json)).toList();
+
+            // Update cache
+            _cachedMessages.clear();
+            _cachedMessages.addAll(messages);
+
+            if (!controller.isClosed) {
+              controller.add(messages);
+            }
+          });
+
+      controller.onCancel = () {
+        subscription.cancel();
+      };
+    }
+
     // Fetch initial messages
     getMessages(conversationId).then((messages) {
       if (!controller.isClosed) {
@@ -239,28 +275,7 @@ class ConversationRepository {
       }
     });
 
-    // Subscribe to real-time updates
-    final subscription = _client
-        .from('messages')
-        .stream(primaryKey: ['id'])
-        .eq('conversation_id', conversationId)
-        .order('created_at', ascending: true)
-        .listen((List<Map<String, dynamic>> data) {
-          final messages =
-              data.map((json) => ChatMessage.fromJson(json)).toList();
-
-          // Update cache
-          _cachedMessages.clear();
-          _cachedMessages.addAll(messages);
-
-          if (!controller.isClosed) {
-            controller.add(messages);
-          }
-        });
-
-    controller.onCancel = () {
-      subscription.cancel();
-    };
+    unawaited(attachSubscription());
 
     return controller.stream;
   }

@@ -1,0 +1,9 @@
+pyproject.toml
+asr_worker/__init__.py
+asr_worker/app.py
+asr_worker/service.py
+asr_worker.egg-info/PKG-INFO
+asr_worker.egg-info/SOURCES.txt
+asr_worker.egg-info/dependency_links.txt
+asr_worker.egg-info/requires.txt
+asr_worker.egg-info/top_level.txt

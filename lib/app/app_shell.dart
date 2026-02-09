@@ -133,17 +133,10 @@ class _AppShellState extends State<AppShell> {
       child: AppStateBuilder(builder: (context, state) {
         final mq = MediaQuery.of(context);
 
-        // Gateway URL
-        // Use local gateway. Recommended for Android device testing: use `adb reverse tcp:8080 tcp:8080`
-        const useLocalGateway = true; // Use local gateway
-        final gatewayUrl = useLocalGateway
-            ? 'ws://10.91.155.95:8080'
-            : 'wss://beforedoctor-gateway-531178459822.us-central1.run.app';
-
-        // Allow real gateway even with mock token for development
-        // Set to false to force real audio (requires gateway server running)
-        final useMockGateway =
-            false; // Set to true for UI testing without gateway
+        // Backend selection
+        // The app now uses Supabase (Edge Functions) as the backend for voice turns.
+        // Gateway/WebSocket configuration is intentionally disabled in the frontend.
+        const useMockGateway = false; // Set true for UI-only testing
 
         final pages = [
           HomeScreen(
@@ -152,7 +145,9 @@ class _AppShellState extends State<AppShell> {
               onProfileChange: _setProfile),
           // Use VoiceLiveScreenV2 (new Gemini Live-style UI)
           VoiceLiveScreenV2(
-            gatewayUrl: Uri.parse(gatewayUrl),
+            // Kept for backward compatibility with the screen/controller signature.
+            // Not used when SupabaseGatewayClient is active.
+            gatewayUrl: Uri.parse('ws://unused.local'),
             // Use Supabase access token (replaces Firebase ID token)
             firebaseIdToken:
                 _supabaseAccessToken, // Uses same parameter name for backward compatibility

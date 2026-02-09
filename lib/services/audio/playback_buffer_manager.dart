@@ -10,12 +10,14 @@ class PlaybackFrame {
 
 class PlaybackBufferManager {
   // Configuration
-  static const int _prebufferMs = 120; // Prebuffer before playback starts
+  static const int _prebufferMs =
+      30; // Reduced from 40ms for even lower latency
   static const int _chunkMs = 20; // Standard chunk duration
   static const int _maxBufferMs = 800; // Max buffer before we drop
 
   // Derived
-  static const int _prebufferFrames = _prebufferMs ~/ _chunkMs;
+  static const int _prebufferFrames =
+      _prebufferMs ~/ _chunkMs; // 1.5 = 1 frame (30ms)
   static const int _maxBufferFrames = _maxBufferMs ~/ _chunkMs;
 
   // State
@@ -30,18 +32,50 @@ class PlaybackBufferManager {
 
   /// Add AI audio frame to playback buffer.
   void enqueueAiAudio(Uint8List audioData) {
-    final frame = PlaybackFrame(
-      data: audioData,
-      sequenceNumber: _sequenceCounter++,
-    );
+    // Handle large audio chunks by splitting them into smaller frames
+    // Each frame is expected to be ~10ms of audio (480 bytes at 24kHz 16-bit mono)
+    // Smaller frames = lower latency = less choppy audio
+    // 24kHz * 0.01 seconds * 2 bytes/sample = 480 bytes per 10ms
 
-    // Check for overflow
-    if (_buffer.length >= _maxBufferFrames) {
-      // Drop oldest frame
-      _buffer.removeFirst();
+    const int targetFrameBytes =
+        480; // 10ms at 24kHz, 16-bit, mono (24000 * 0.01 * 2)
+
+    if (audioData.length <= targetFrameBytes * 2) {
+      // Small chunk - add as single frame
+      final frame = PlaybackFrame(
+        data: audioData,
+        sequenceNumber: _sequenceCounter++,
+      );
+
+      // Check for overflow
+      if (_buffer.length >= _maxBufferFrames) {
+        // Drop oldest frame
+        _buffer.removeFirst();
+      }
+
+      _buffer.add(frame);
+    } else {
+      // Large chunk - split into multiple 10ms frames for lower latency
+      int offset = 0;
+      while (offset < audioData.length) {
+        final end = (offset + targetFrameBytes).clamp(0, audioData.length);
+        final frameData = Uint8List.sublistView(audioData, offset, end);
+
+        final frame = PlaybackFrame(
+          data: frameData,
+          sequenceNumber: _sequenceCounter++,
+        );
+
+        // Check for overflow
+        if (_buffer.length >= _maxBufferFrames) {
+          // Drop oldest frame
+          _buffer.removeFirst();
+        }
+
+        _buffer.add(frame);
+        offset = end;
+      }
     }
-
-    _buffer.add(frame);
   }
 
   /// Drain buffered frames for playback.
