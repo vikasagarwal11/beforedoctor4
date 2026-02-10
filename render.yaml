@@ -1,0 +1,65 @@
+services:
+  - type: web
+    name: audio-agent-api
+    runtime: node
+    rootDir: audio-agent
+    plan: standard
+    buildCommand: npm install; npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      - key: PIPELINE_MODE
+        value: full
+      - key: DATABASE_URL
+        sync: false
+      - key: ASR_WORKER_URL
+        sync: false
+      - key: TTS_WORKER_URL
+        sync: false
+      - key: LLM_PROVIDER
+        sync: false
+      - key: LLM_BASE_URL
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+      - key: LLM_TEMPERATURE
+        sync: false
+      - key: LLM_MAX_TOKENS
+        sync: false
+      - key: TTS_FALLBACK
+        sync: false
+      - key: AUDIO_SAMPLE_RATE
+        value: "24000"
+
+  - type: web
+    name: audio-agent-asr
+    runtime: python
+    rootDir: audio-agent/workers/asr
+    plan: standard
+    buildCommand: pip install --upgrade pip; pip install .
+    startCommand: uvicorn asr_worker.app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: ASR_MODEL_ID
+        value: openai/whisper-large-v3
+      - key: ASR_DEVICE
+        value: cpu
+
+  - type: web
+    name: audio-agent-tts
+    runtime: python
+    rootDir: audio-agent/workers/tts
+    plan: standard
+    buildCommand: pip install --upgrade pip; pip install .
+    startCommand: uvicorn tts_worker.app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: TTS_MODEL_NAME
+        value: tts_models/multilingual/multi-dataset/xtts_v2

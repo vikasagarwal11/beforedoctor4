@@ -1,0 +1,43 @@
+{
+  "name": "audio-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "lint": "eslint .",
+    "format": "prettier -w .",
+    "db:migrate": "node dist/scripts/run-migrations.js",
+    "db:migrate:dev": "tsx scripts/run-migrations.ts"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^9.0.3",
+    "@fastify/websocket": "^11.2.0",
+    "beforedoctor4": "file:..",
+    "dotenv": "^16.4.5",
+    "fastify": "^5.2.1",
+    "http-errors": "^2.0.0",
+    "pg": "^8.13.3",
+    "pino": "^9.6.0",
+    "pino-pretty": "^11.3.0",
+    "uuid": "^11.0.5",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.20.0",
+    "@types/http-errors": "^2.0.4",
+    "@types/node": "^22.13.0",
+    "@types/pg": "^8.11.11",
+    "@types/uuid": "^10.0.0",
+    "eslint": "^9.20.0",
+    "globals": "^15.14.0",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

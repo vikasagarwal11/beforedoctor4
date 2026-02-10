@@ -1,8 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:isolate';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
+import 'package:uuid/uuid.dart';
 
+import '../../data/models/conversation.dart';
+import '../../data/repositories/conversation_repository.dart';
 import '../../services/audio/audio_engine_service.dart';
 import '../../services/audio/audio_queue_manager.dart';
 import '../../services/audio/playback_buffer_manager.dart';
@@ -10,6 +15,28 @@ import '../../services/audio/vad_processor.dart';
 import '../../services/gateway/gateway_client.dart';
 import '../../services/gateway/gateway_protocol.dart' as gw;
 import '../../services/logging/app_logger.dart';
+
+/// ============================================================================
+/// AUDIO PLAYBACK LIFECYCLE ARCHITECTURE
+/// ============================================================================
+///
+/// CRITICAL PRINCIPLE: Audio playback is driven ONLY by incoming audio chunks.
+///
+/// RULES:
+/// 1. Each audioOut event resets a 2000ms silence timer via _resetSilenceTimer()
+/// 2. If no chunk arrives for 2000ms, _finalizePlayback() is called automatically
+/// 3. transcriptFinal events do NOT stop, clear, or affect audio playback
+/// 4. Text completion != Audio completion (TTS may still be streaming)
+/// 5. Playback state machine: IDLE → PLAYING → FINISHING → IDLE
+///
+/// EDGE CASES HANDLED:
+/// - Network jitter: Timer resets on each chunk, no matter the delay
+/// - Long responses: Timer keeps resetting while audio streams
+/// - Rapid responses: New chunks cancel previous timer, continue playing
+/// - Slow streaming: Full response plays regardless of gaps between chunks
+///
+/// RESULT: Full AI responses ALWAYS play completely, never truncated.
+/// ============================================================================
 
 enum VoiceUiState {
   idle,
@@ -22,15 +49,28 @@ enum VoiceUiState {
   stopped,
 }
 
+/// Audio playback state machine - driven ONLY by incoming audio chunks.
+/// Never affected by text events (transcriptFinal).
+enum AudioPlaybackState {
+  idle, // No audio playing
+  playing, // Actively receiving and playing chunks
+  finishing, // Last chunk received, draining buffer
+}
+
 class VoiceSessionControllerV2 extends ChangeNotifier {
   // Dependencies
   final IGatewayClient gateway;
   final IAudioEngine audio;
   final AppLogger logger = AppLogger.instance;
+  final ConversationRepository _conversationRepo = ConversationRepository();
+  final Uuid _localUuid = const Uuid();
 
   // Configuration
   final bool preferBinaryAudio;
   final VadSensitivity vadSensitivity;
+
+  // Mode management
+  bool _isAudioModeEnabled = true; // Audio mode active by default
 
   // Session state
   VoiceUiState _uiState = VoiceUiState.idle;
@@ -39,8 +79,10 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
 
   // Reconnection state
   int _reconnectAttempts = 0;
-  static const int _maxReconnectAttempts = 5;
-  static const Duration _baseReconnectDelay = Duration(seconds: 2);
+  static const int _maxReconnectAttempts =
+      20; // Increased from 5 for long sessions
+  static const Duration _baseReconnectDelay =
+      Duration(seconds: 1); // Reduced from 2s for faster recovery
   Timer? _reconnectTimer;
 
   // Stored for reconnect
@@ -54,20 +96,70 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
   late PlaybackBufferManager _playbackBuffer;
 
   // Timers
-  Timer? _sendLoopTimer; // Send audio every 20ms
-  Timer? _playbackDrainTimer; // Drain playback buffer every 20ms
+  Timer? _sendLoopTimer; // Send audio every 10ms
+  PlaybackClock? _playbackClock; // Clock-driven playback loop
   Timer? _serverReadyTimer;
+  Timer? _silenceDetectionTimer; // Detect silence and send turnComplete
+  Timer? _assistantDoneTimer; // Return UI to idle after assistant finishes
+  Timer? _audioStopTimer; // Auto-stop playback after audio finishes
 
-  // Event subscriptions
+  // Silence detection for auto-turnComplete
+  DateTime _lastAudioFrameTime = DateTime.now();
+  DateTime? _lastAiAudioReceivedTime;
+  bool _turnCompleteAlreadySent = false;
+  static const Duration _silenceThreshold =
+      Duration(seconds: 2); // 2 seconds of silence - allow natural pauses
   StreamSubscription<gw.GatewayEvent>? _gatewayEventSub;
+  StreamSubscription<List<ChatMessage>>? _messageStreamSub;
 
   // State info
   String userTranscriptPartial = '';
   String userTranscriptFinal = '';
+  String userDraftText = '';
+  bool isUserDraftEditing = false;
+  bool _textTurnInFlight = false;
+  String _lastSentUserText = '';
+  DateTime? _lastSentUserAt;
   String assistantTextPartial = '';
   String assistantTextFinal = '';
   String? lastError;
   bool showReconnectPrompt = false;
+
+  // Conversation management
+  Conversation? _activeConversation;
+  final List<ChatMessage> _messages = [];
+
+  // Assistant message de-duplication for streaming/final updates
+  String? _lastAssistantMessageId;
+  String _lastAssistantMessageText = '';
+  DateTime? _lastAssistantMessageAt;
+
+  bool _transcribingPending = false;
+  bool get isTranscribingPending => _transcribingPending;
+
+  bool _aiMuted = false;
+  bool get isAiMuted => _aiMuted;
+
+  // Audio playback state machine - driven ONLY by incoming audio chunks
+  AudioPlaybackState _audioPlaybackState = AudioPlaybackState.idle;
+  DateTime? _playbackClockStart;
+  int _playbackFramesSent = 0;
+  int _playbackTicks = 0;
+  bool _audioEndReceived = false;
+  static const Duration _audioSilenceTimeout = Duration(milliseconds: 3000);
+
+  // Enforce monotonic created_at for message ordering
+  DateTime? _lastMessageTimestamp;
+
+  // Live transcript tracking (for draft merge while editing)
+  String _liveUserTranscript = '';
+  String _lastCommittedTranscript =
+      ''; // Track what's been added to userDraftText
+
+  // VAD turn-complete detection
+  bool _inUserUtterance = false;
+  int _silenceFramesAfterSpeech = 0;
+  static const int _silenceFramesToEnd = 15; // ~300ms at 20ms frames
 
   // Metrics
   int capturedChunks = 0;
@@ -86,6 +178,15 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
   }
 
   VoiceUiState get uiState => _uiState;
+
+  /// Check if audio mode is enabled (mic is active)
+  bool get isAudioModeEnabled => _isAudioModeEnabled;
+
+  /// Get conversation messages (full chat history)
+  List<ChatMessage> get messages => List.unmodifiable(_messages);
+
+  /// Get active conversation
+  Conversation? get activeConversation => _activeConversation;
 
   /// Start a voice session.
   Future<void> start({
@@ -110,27 +211,51 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
         'url': gatewayUrl.toString(),
       });
 
+      // Initialize conversation BEFORE gateway connection
+      await _initializeConversation();
+      logger.info('voice.conversation_initialized', data: {
+        'conversation_id': _activeConversation?.id,
+      });
+
       await gateway
           .connect(
         url: gatewayUrl,
         firebaseIdToken: firebaseIdToken,
         sessionConfig: sessionConfig,
+        conversationId: _activeConversation?.id,
       )
           .timeout(const Duration(seconds: 10), onTimeout: () {
         throw TimeoutException('Gateway connection timeout');
       });
+
+      logger.info('voice.gateway_connected_successfully');
 
       _sessionActive = true;
       _serverReady = false;
 
       _setupGatewayEventListener();
 
-      _startMicCapture();
+      // Initialize audio playback for AI responses
+      try {
+        await audio.playback.setup();
+        logger.info('voice.playback_initialized');
+      } catch (e) {
+        logger.error('voice.playback_setup_failed', error: e);
+      }
+
+      // Start audio loops immediately
       _startSendLoop();
       _startPlaybackDrainLoop();
-      _waitForServerReady();
 
-      logger.info('voice.session_started');
+      // Force server ready immediately - no waiting
+      _serverReady = true;
+      _setState(VoiceUiState.idle);
+
+      logger.info('voice.session_started', data: {
+        'session_active': _sessionActive,
+        'server_ready': _serverReady,
+        'gateway_connected': gateway.isConnected,
+      });
     } catch (e) {
       lastError = 'Failed to start session: $e';
       logger.error('voice.start_failed', error: e);
@@ -156,6 +281,96 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
     }
   }
 
+  /// Start mic capture only (session already connected)
+  void startMicCapture() {
+    logger.info('voice.startMicCapture_called', data: {
+      'session_active': _sessionActive,
+      'current_state': _uiState.toString(),
+    });
+
+    if (!_sessionActive) {
+      logger.error('voice.mic_start_no_session');
+      lastError = 'Session not active. Try restarting the app.';
+      notifyListeners();
+      return;
+    }
+
+    // Reset silence detection for new utterance
+    _lastAudioFrameTime = DateTime.now();
+    _turnCompleteAlreadySent = false;
+    _startSilenceDetection();
+
+    _startMicCapture();
+    _setState(VoiceUiState.listening);
+    _transcribingPending = false;
+    logger.info('voice.mic_capture_started');
+  }
+
+  /// Stop mic capture only (keep session alive)
+  void stopMicCapture() {
+    try {
+      audio.capture.stop();
+      _silenceDetectionTimer?.cancel();
+
+      // Send turnComplete to Vertex to end the turn
+      if (!_turnCompleteAlreadySent && gateway.isConnected && _serverReady) {
+        unawaited(gateway.sendTurnComplete(transcribeOnly: true));
+        _turnCompleteAlreadySent = true;
+        logger.info('voice.turn_complete_sent_on_mic_stop');
+      }
+
+      // Show transcribing indicator until final transcript arrives
+      _transcribingPending = true;
+      notifyListeners();
+
+      _setState(VoiceUiState.idle);
+      logger.info('voice.mic_stopped');
+    } catch (e) {
+      logger.error('voice.mic_stop_failed', error: e);
+    }
+  }
+
+  /// Save/submit the current transcript to database
+  /// This is called when user confirms the transcript by pressing send
+  Future<void> submitTranscript(String textToSubmit) async {
+    if (textToSubmit.trim().isEmpty) {
+      logger.warn('voice.submit_empty_transcript');
+      lastError = 'Cannot submit empty transcript';
+      notifyListeners();
+      return;
+    }
+
+    try {
+      logger.info('voice.submitting_transcript', data: {
+        'length': textToSubmit.length,
+        'conversation_id': _activeConversation?.id,
+      });
+
+      if (_activeConversation == null) {
+        throw Exception('No active conversation');
+      }
+
+      await _addOptimisticMessage(
+        role: MessageRole.user,
+        content: textToSubmit,
+      );
+
+      // Clear the draft and reset tracking
+      userDraftText = '';
+      userTranscriptPartial = '';
+      userTranscriptFinal = '';
+      _liveUserTranscript = '';
+      _lastCommittedTranscript = ''; // Reset for next utterance
+
+      logger.info('voice.transcript_submitted_successfully');
+      notifyListeners();
+    } catch (e) {
+      lastError = 'Failed to submit transcript: $e';
+      logger.error('voice.submit_transcript_failed', error: e);
+      notifyListeners();
+    }
+  }
+
   /// Manual reconnect button.
   Future<void> reconnect() async {
     if (_lastGatewayUrl == null ||
@@ -178,9 +393,10 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
 
   void _setState(VoiceUiState newState) {
     if (_uiState != newState) {
+      final previous = _uiState;
       _uiState = newState;
       logger.debug('voice.state_changed', data: {
-        'from': _uiState.toString(),
+        'from': previous.toString(),
         'to': newState.toString(),
       });
       notifyListeners();
@@ -202,13 +418,35 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
     try {
       audio.capture.start(onPcm16k: (chunk) {
         capturedChunks++;
+        _lastAudioFrameTime = DateTime.now();
 
-        // Apply VAD
-        final vadDecision = _vad.processFrame(chunk);
+        // Split large chunks into 20ms frames for real-time streaming
+        // 16kHz mono PCM16 = 2 bytes per sample = 640 bytes per 20ms frame
+        const int frameSize = 640; // 20ms at 16kHz, 2 bytes/sample
 
-        // Enqueue if speech or prebuffering
-        if (vadDecision == VadDecision.speech ||
-            _audioQueue.queueDepthFrames < 10) {
+        if (chunk.length > frameSize) {
+          // Large chunk - split into 20ms frames
+          for (int i = 0; i < chunk.length; i += frameSize) {
+            final end = (i + frameSize).clamp(0, chunk.length);
+            final frame = chunk.sublist(i, end);
+            final dropped = !_audioQueue.enqueue(
+                frame, DateTime.now().millisecondsSinceEpoch);
+            if (dropped) {
+              logger.warn('voice.audio_frame_dropped', data: {
+                'queue_depth': _audioQueue.queueDepthFrames,
+              });
+            }
+          }
+
+          // Log when splitting large chunks
+          if (chunk.length > frameSize * 2) {
+            logger.debug('voice.large_chunk_split', data: {
+              'original_size': chunk.length,
+              'frame_count': (chunk.length / frameSize).ceil(),
+            });
+          }
+        } else {
+          // Small chunk - enqueue as-is
           final dropped = !_audioQueue.enqueue(
               chunk, DateTime.now().millisecondsSinceEpoch);
           if (dropped) {
@@ -217,41 +455,111 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
             });
           }
         }
+
+        // Log every 50th chunk to show audio is flowing
+        if (capturedChunks % 50 == 0) {
+          logger.debug('voice.audio_chunks_captured', data: {
+            'total_chunks': capturedChunks,
+            'chunk_size': chunk.length,
+          });
+        }
       });
+      logger.info('voice.capture_started_successfully');
     } catch (e) {
       logger.error('voice.capture_start_failed', error: e);
       _setState(VoiceUiState.error);
     }
   }
 
+  void _startSilenceDetection() {
+    _silenceDetectionTimer?.cancel();
+
+    // Check every 100ms if silence threshold has been exceeded
+    _silenceDetectionTimer =
+        Timer.periodic(const Duration(milliseconds: 100), (_) {
+      final timeSinceLastFrame = DateTime.now().difference(_lastAudioFrameTime);
+
+      // If silence threshold exceeded and we haven't sent turnComplete yet
+      if (timeSinceLastFrame > _silenceThreshold && !_turnCompleteAlreadySent) {
+        logger.info('voice.silence_detected_sending_turn_complete', data: {
+          'silence_duration_ms': timeSinceLastFrame.inMilliseconds,
+        });
+
+        if (gateway.isConnected && _serverReady) {
+          unawaited(gateway.sendTurnComplete(transcribeOnly: true));
+          _turnCompleteAlreadySent = true;
+          _silenceDetectionTimer?.cancel();
+        }
+      }
+    });
+  }
+
   void _startSendLoop() {
     _sendLoopTimer?.cancel();
     logger.info('voice.send_loop_starting');
 
+    // 20ms matches our frame size; reduces CPU/log pressure vs 10ms.
     _sendLoopTimer = Timer.periodic(const Duration(milliseconds: 20), (_) {
-      if (!_sessionActive || !_serverReady) return;
+      if (!_sessionActive) return;
 
-      // If the socket dropped, stop sending immediately and let reconnect logic run.
-      if (!gateway.isConnected) {
-        _handleGatewayDisconnected('Gateway not connected');
-        return;
-      }
+      // Only process audio when mic is actively listening
+      if (_uiState != VoiceUiState.listening) return;
 
+      // Send audio batch - will buffer if disconnected
       _sendAudioBatch();
     });
   }
 
   void _sendAudioBatch() {
     try {
-      final batch = _audioQueue.dequeueBatch();
-      if (batch.isEmpty) return;
-
-      if (!gateway.isConnected) {
-        _handleGatewayDisconnected('Gateway not connected');
-        return;
+      // Only send audio when mic is actively capturing (listening state)
+      if (_uiState != VoiceUiState.listening) {
+        return; // Don't send any audio if not actively recording
       }
 
+      // If queue is backing up, send everything immediately to prevent batching
+      // This prevents the native audio engine's large buffers from accumulating
+      final isFull = _audioQueue.isQueueFull;
+      final batch =
+          isFull ? _audioQueue.dequeueAll() : _audioQueue.dequeueUpTo(2);
+
+      if (batch.isEmpty) return;
+
+      if (isFull) {
+        logger.warn('voice.queue_full_flushing', data: {
+          'frames_flushed': batch.length,
+          'queue_depth': _audioQueue.queueDepthFrames,
+        });
+      }
+
+      // During reconnection, keep buffering audio instead of trying to send
+      if (!gateway.isConnected) {
+        // Re-enqueue the frames we just dequeued
+        for (final frame in batch.reversed) {
+          _audioQueue.enqueue(frame.data, frame.timestampMs);
+        }
+        logger.debug('voice.audio_buffered_during_reconnect', data: {
+          'queue_depth': _audioQueue.queueDepthFrames,
+        });
+        return; // Don't trigger disconnect handler, just buffer
+      }
+
+      // Send frames one by one in real-time
       for (final frame in batch) {
+        sentChunks++;
+
+        // Update last audio frame time for silence detection
+        _lastAudioFrameTime = DateTime.now();
+
+        // Log every 100th chunk sent
+        if (sentChunks % 100 == 0) {
+          logger.debug('voice.audio_batches_sent', data: {
+            'total_sent': sentChunks,
+            'queue_depth': _audioQueue.queueDepthFrames,
+            'gateway_connected': gateway.isConnected,
+          });
+        }
+
         // Send as binary PCM frame for lowest latency.
         // Ignore backpressure here; gateway/client will surface disconnects via events.
         unawaited(
@@ -261,83 +569,210 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
             _handleGatewayDisconnected(e.toString());
           }),
         );
-        sentChunks++;
       }
-
-      logger.debug('voice.audio_batch_sent', data: {
-        'frame_count': batch.length,
-        'queue_depth': _audioQueue.queueDepthFrames,
-      });
     } catch (e) {
       logger.error('voice.send_audio_failed', error: e);
     }
   }
 
   void _startPlaybackDrainLoop() {
-    _playbackDrainTimer?.cancel();
+    _playbackClock?.stop();
     logger.info('voice.playback_drain_starting');
 
-    _playbackDrainTimer = Timer.periodic(const Duration(milliseconds: 20), (_) {
-      if (!_sessionActive) return;
-
-      _drainPlaybackBuffer();
-    });
+    _playbackClock = PlaybackClock(
+      frameSamples: PlaybackBufferManager.frameSamples,
+      sampleRate: PlaybackBufferManager.sampleRate,
+      onTick: () {
+        if (!_sessionActive) return;
+        _drainPlaybackBuffer();
+      },
+    )..start();
   }
 
   void _drainPlaybackBuffer() {
-    try {
-      final frames = _playbackBuffer.drainFrames();
-      if (frames.isEmpty) return;
+    if (!_sessionActive) {
+      logger.debug('voice.playback_drain_skipped_not_active');
+      return;
+    }
 
-      for (final frame in frames) {
-        audio.playback.feed(frame.data);
+    if (_aiMuted) {
+      // Only log occasionally to avoid spam
+      if (_playbackBuffer.bufferedSamples > 0) {
+        logger.debug('voice.playback_drain_skipped_muted', data: {
+          'buffer_level_ms': _playbackBuffer.bufferedMs,
+        });
+      }
+      return;
+    }
+
+    try {
+      _playbackTicks += 1;
+      if (_playbackTicks % 50 == 0) {
+        logger.debug('voice.playback_tick', data: {
+          'buffer_level_ms': _playbackBuffer.bufferedMs,
+          'buffered_samples': _playbackBuffer.bufferedSamples,
+        });
       }
 
-      logger.debug('voice.playback_drained', data: {
-        'frame_count': frames.length,
-        'buffer_depth': _playbackBuffer.bufferDepthMs,
+      final bufferedMs = _playbackBuffer.bufferedMs;
+
+      if (!_playbackBuffer.isPlaybackInitialized) {
+        if (_playbackBuffer.isPrebuffering) {
+          if (bufferedMs > 0 && bufferedMs % 100 == 0) {
+            logger.info('voice.playback_prebuffering', data: {
+              'buffer_level_ms': bufferedMs,
+              'buffered_samples': _playbackBuffer.bufferedSamples,
+            });
+          }
+        }
+
+        if (_playbackBuffer.canStartPlayback) {
+          _playbackBuffer.markPlaybackStarted();
+          _playbackClockStart = DateTime.now();
+          _playbackFramesSent = 0;
+          unawaited(audio.playback.setup().then((_) {
+            logger.info('voice.playback_started', data: {
+              'buffer_level_ms': bufferedMs,
+              'buffered_samples': _playbackBuffer.bufferedSamples,
+            });
+          }).catchError((e) {
+            logger.error('voice.playback_setup_failed', error: e);
+          }));
+        }
+        return;
+      }
+
+      if (_audioEndReceived && _playbackBuffer.bufferedSamples == 0) {
+        logger.info('voice.playback_stopped', data: {
+          'reason': 'audio_end',
+        });
+        _finalizePlayback();
+        return;
+      }
+
+      final pull = _playbackBuffer.pullFrame();
+      if (pull.usedSilence) {
+        logger.info('voice.playback_underrun_prevented', data: {
+          'buffered_samples': _playbackBuffer.bufferedSamples,
+          'padded_samples': pull.paddedSamples,
+        });
+        logger.info('voice.silence_padded_samples', data: {
+          'padded_samples': pull.paddedSamples,
+        });
+      }
+
+      logger.debug('voice.playback_feed', data: {
+        'chunk_bytes': pull.data.length,
+        'buffer_level_ms': _playbackBuffer.bufferedMs,
+        'buffered_samples': _playbackBuffer.bufferedSamples,
       });
+
+      audio.playback.feed(pull.data).catchError((feedError) {
+        logger.error('voice.playback_feed_failed', error: feedError);
+      });
+
+      logger.debug('voice.audio_track_write', data: {
+        'chunk_bytes': pull.data.length,
+        'buffer_level_ms': _playbackBuffer.bufferedMs,
+      });
+
+      _playbackFramesSent += 1;
+      if (_playbackClockStart != null && _playbackFramesSent % 50 == 0) {
+        final expectedMs = _playbackFramesSent * PlaybackBufferManager.frameMs;
+        final actualMs =
+            DateTime.now().difference(_playbackClockStart!).inMilliseconds;
+        logger.debug('voice.playback_clock_drift', data: {
+          'expected_ms': expectedMs,
+          'actual_ms': actualMs,
+          'drift_ms': actualMs - expectedMs,
+        });
+      }
     } catch (e) {
       logger.error('voice.playback_drain_failed', error: e);
     }
   }
 
-  void _waitForServerReady() {
-    _serverReadyTimer?.cancel();
-    logger.info('voice.waiting_for_server_ready');
+  /// ========================================================================
+  /// AUDIO PLAYBACK LIFECYCLE - Driven ONLY by incoming audio chunks
+  /// ========================================================================
 
-    // Log current connection state
-    logger.debug('voice.connection_check', data: {
-      'gateway_connected': gateway.isConnected,
-      'session_active': _sessionActive,
+  /// Reset the silence timer - called whenever a new audio chunk arrives.
+  /// This is the ONLY mechanism that drives playback lifecycle.
+  /// Audio stops 2000ms after the last chunk, regardless of text events.
+  void _resetSilenceTimer() {
+    // Cancel any existing timer
+    _audioStopTimer?.cancel();
+
+    // Update state to PLAYING if not already
+    if (_audioPlaybackState != AudioPlaybackState.playing) {
+      _audioPlaybackState = AudioPlaybackState.playing;
+      logger.debug('voice.playback_state_changed', data: {'state': 'playing'});
+    }
+
+    final bufferedMs = _playbackBuffer.bufferedMs;
+    final timeoutMs = math.max(
+      _audioSilenceTimeout.inMilliseconds,
+      bufferedMs + 1000,
+    );
+
+    // Schedule finalization after silence timeout (scaled for buffered audio)
+    _audioStopTimer = Timer(Duration(milliseconds: timeoutMs), () {
+      logger.info('voice.audio_silence_detected', data: {
+        'timeout_ms': timeoutMs,
+        'buffered_ms': bufferedMs,
+      });
+      _finalizePlayback();
+    });
+  }
+
+  /// Finalize playback - called after audio silence timeout expires.
+  /// Stops audio output, clears buffers, and resets state to IDLE.
+  void _finalizePlayback() {
+    if (_audioPlaybackState == AudioPlaybackState.idle) {
+      return; // Already finalized
+    }
+
+    logger.info('voice.finalizing_playback', data: {
+      'previous_state': _audioPlaybackState.toString(),
     });
 
-    _serverReadyTimer = Timer(const Duration(seconds: 5), () {
-      if (!_serverReady && _sessionActive) {
-        // Only force ready if the gateway is still connected.
-        // If disconnected, forcing ready will cause repeated send failures.
-        if (!gateway.isConnected) {
-          logger.warn('voice.server_ready_timeout_gateway_disconnected', data: {
-            'gateway_connected': gateway.isConnected,
-            'session_active': _sessionActive,
-          });
-          _handleGatewayDisconnected(
-              'Gateway disconnected while waiting for ready');
-          return;
-        }
+    // Transition to finishing state
+    _audioPlaybackState = AudioPlaybackState.finishing;
 
-        logger.warn('voice.server_ready_timeout_forcing_ready', data: {
-          'gateway_connected': gateway.isConnected,
-          'session_active': _sessionActive,
-        });
+    // Clear playback buffer
+    _playbackBuffer.resetForTurn();
+    _playbackClockStart = null;
+    _playbackFramesSent = 0;
 
-        // FAILSAFE: Gateway should have sent listening state by now.
-        _serverReady = true;
-        _setState(VoiceUiState.listening);
-        _startSendLoop();
-        logger.info('voice.forced_server_ready_to_unblock_audio');
-      }
-    });
+    // Reset audio chunk counter for next turn
+    receivedAudioChunks = 0;
+
+    // Stop audio output
+    try {
+      audio.playback.stop();
+      logger.info('voice.playback_stopped');
+    } catch (e) {
+      logger
+          .debug('voice.playback_stop_ignored', data: {'error': e.toString()});
+    }
+
+    // Reset audio engine for next turn (allows re-initialization)
+    unawaited(audio.playback.cleanup().then((_) {
+      logger.debug('voice.playback_engine_reset_for_next_turn');
+    }).catchError((e) {
+      logger
+          .debug('voice.playback_cleanup_error', data: {'error': e.toString()});
+    }));
+
+    // Return to idle state
+    _audioPlaybackState = AudioPlaybackState.idle;
+
+    // Update UI state if still speaking
+    if (_uiState == VoiceUiState.speaking) {
+      _setState(VoiceUiState.idle);
+    }
+
+    logger.info('voice.playback_finalized');
   }
 
   void _handleGatewayDisconnected(String reason) {
@@ -365,57 +800,208 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
 
     switch (ev.type) {
       case gw.GatewayEventType.sessionState:
-        if (ev.payload['state'] == 'listening') {
+        final state = ev.payload['state'] as String?;
+
+        if (state == 'thinking') {
+          // Ignore late thinking updates once we are already speaking
+          if (_uiState != VoiceUiState.speaking) {
+            _setState(VoiceUiState.thinking);
+            logger.info('voice.server_thinking');
+          } else {
+            logger.debug('voice.server_thinking_ignored_while_speaking');
+          }
+        } else if (state == 'ready') {
           _serverReady = true;
           _serverReadyTimer?.cancel();
-          _setState(VoiceUiState.listening);
+          // Don't auto-start listening - wait for user to press mic button
           logger.info('voice.server_ready');
+        } else if (state == 'listening') {
+          _serverReady = true;
+          _serverReadyTimer?.cancel();
+          // Don't auto-start listening - wait for user to press mic button
+          logger.info('voice.server_listening');
         }
         break;
 
+      case gw.GatewayEventType.audioStart:
+        _audioEndReceived = false;
+        _playbackBuffer.resetForTurn();
+        receivedAudioChunks = 0;
+        logger.info('voice.audio_start');
+        break;
+
+      case gw.GatewayEventType.audioEnd:
+        _audioEndReceived = true;
+        logger.info('voice.audio_end');
+        break;
+
+      case gw.GatewayEventType.audioChunk:
       case gw.GatewayEventType.audioOut:
+        if (_aiMuted) {
+          logger.info('voice.ai_audio_muted_skipped');
+          return;
+        }
         receivedAudioChunks++;
         final b64 = ev.payload['data'] as String?;
-        if (b64 == null || b64.isEmpty) return;
+        if (b64 == null || b64.isEmpty) {
+          logger.warn('voice.ai_audio_empty');
+          return;
+        }
         try {
           final audioBytes = base64Decode(b64);
-          _playbackBuffer.enqueueAiAudio(Uint8List.fromList(audioBytes));
-          logger.debug('voice.ai_audio_received', data: {
+          final droppedBytes =
+              _playbackBuffer.enqueueAiAudio(Uint8List.fromList(audioBytes));
+
+          if (droppedBytes > 0) {
+            logger.warn('voice.playback_buffer_drop', data: {
+              'dropped_bytes': droppedBytes,
+              'buffer_level_ms': _playbackBuffer.bufferedMs,
+              'buffered_samples': _playbackBuffer.bufferedSamples,
+            });
+          }
+
+          if (receivedAudioChunks % 10 == 0) {
+            logger.info('voice.audio_chunk_received', data: {
+              'chunk_count': receivedAudioChunks,
+              'buffer_level_ms': _playbackBuffer.bufferedMs,
+              'buffered_samples': _playbackBuffer.bufferedSamples,
+            });
+          }
+
+          // Track last audio received time for metrics
+          _lastAiAudioReceivedTime = DateTime.now();
+
+          // === CRITICAL: Reset silence timer on EVERY audio chunk ===
+          // This is the ONLY driver of playback lifecycle.
+          // Audio stops after silence timeout or audioStop event.
+          // transcriptFinal events do NOT affect playback.
+          _resetSilenceTimer();
+
+          // === CRITICAL: Force transition to speaking on FIRST audio/text ===
+          // REQUIREMENT: Thinking animation MUST NOT be visible once response starts
+          // This prevents THINKING + SPEAKING overlap
+          if (_uiState == VoiceUiState.thinking) {
+            _setState(VoiceUiState.speaking);
+            logger.info(
+                'voice.state_transition_thinking_to_speaking_audio_triggered');
+          }
+
+          logger.info('voice.ai_audio_received', data: {
             'size_bytes': audioBytes.length,
+            'buffer_level_ms': _playbackBuffer.bufferedMs,
+            'buffered_samples': _playbackBuffer.bufferedSamples,
+            'is_prebuffering': _playbackBuffer.isPrebuffering,
+            'session_active': _sessionActive,
+            'ai_muted': _aiMuted,
+            'playback_state': _audioPlaybackState.toString(),
           });
         } catch (e) {
-          logger.warn('voice.ai_audio_decode_failed', data: {
-            'error': e.toString(),
-          });
+          logger.error('voice.ai_audio_decode_failed', error: e);
+        }
+        break;
+
+      case gw.GatewayEventType.audioStop:
+        // Gateway signals to stop playback immediately (barge-in / flush)
+        logger.info('voice.audio_stop_requested', data: {
+          'playback_state': _audioPlaybackState.toString(),
+        });
+        _finalizePlayback();
+        if (_uiState == VoiceUiState.thinking) {
+          _setState(VoiceUiState.idle);
+          logger.info('voice.state_transition_thinking_to_idle_audio_stop');
         }
         break;
 
       case gw.GatewayEventType.userTranscriptPartial:
         userTranscriptPartial = ev.payload['text'] as String? ?? '';
+        logger.debug('voice.transcript_partial_received', data: {
+          'text': userTranscriptPartial,
+          'length': userTranscriptPartial.length,
+        });
+        _applyUserTranscriptUpdate(userTranscriptPartial, isFinal: false);
         notifyListeners();
         break;
 
       case gw.GatewayEventType.userTranscriptFinal:
         userTranscriptFinal = ev.payload['text'] as String? ?? '';
-        userTranscriptPartial = '';
+        logger.info('voice.transcript_final_received', data: {
+          'text': userTranscriptFinal,
+          'length': userTranscriptFinal.length,
+        });
+        _transcribingPending = false;
+        // Keep the transcript visible - merge into draft
+        if (userTranscriptFinal.isNotEmpty) {
+          _applyUserTranscriptUpdate(userTranscriptFinal, isFinal: true);
+        }
+        // Don't clear partial - keep it visible for continuous experience
         notifyListeners();
         break;
 
       case gw.GatewayEventType.transcriptPartial:
         assistantTextPartial = ev.payload['text'] as String? ?? '';
+
+        // === CRITICAL: Force transition to speaking on FIRST text (fallback if audio delayed) ===
+        // REQUIREMENT: Thinking animation MUST NOT be visible once response starts
+        // This ensures thinking stops even if text arrives before audio
+        if (assistantTextPartial.isNotEmpty &&
+            (_uiState == VoiceUiState.thinking ||
+                _uiState == VoiceUiState.idle)) {
+          _setState(VoiceUiState.speaking);
+          logger.info(
+              'voice.state_transition_thinking_to_speaking_text_triggered');
+        }
+
+        logger.debug('voice.assistant_transcript_partial', data: {
+          'text_length': assistantTextPartial.length,
+          'text_preview': assistantTextPartial.substring(
+              0, math.min(50, assistantTextPartial.length)),
+        });
         notifyListeners();
         break;
 
       case gw.GatewayEventType.transcriptFinal:
         assistantTextFinal = ev.payload['text'] as String? ?? '';
         assistantTextPartial = '';
-        _setState(VoiceUiState.speaking);
+        logger.debug('voice.assistant_transcript_final', data: {
+          'text_length': assistantTextFinal.length,
+          'text_preview': assistantTextFinal.substring(
+              0, math.min(50, assistantTextFinal.length)),
+        });
+        _textTurnInFlight = false;
+
+        // If text arrives without audio, stop thinking and return to idle.
+        final noAudioReceived = receivedAudioChunks == 0 &&
+            _audioPlaybackState == AudioPlaybackState.idle &&
+            _playbackBuffer.bufferedSamples == 0;
+        if (assistantTextFinal.isNotEmpty &&
+            _uiState == VoiceUiState.thinking &&
+            noAudioReceived) {
+          _setState(VoiceUiState.idle);
+          logger.info('voice.state_transition_thinking_to_idle_text_only');
+        }
+
+        // === CRITICAL: transcriptFinal does NOT affect audio playback ===
+        // Text completion != Audio completion
+        // Playback is driven ONLY by incoming audio chunks via silence timer.
+        // TTS audio may still be streaming after text is finalized.
+        // Do NOT stop, clear, or reset anything related to audio here.
+
+        logger.info('voice.transcript_final_text_complete', data: {
+          'playback_state': _audioPlaybackState.toString(),
+          'note': 'Audio playback continues independently',
+        });
+
+        // Persist assistant message to Supabase (dedupe/update if we get multiple finals)
+        if (assistantTextFinal.isNotEmpty) {
+          unawaited(_persistAssistantMessage(assistantTextFinal));
+        }
         notifyListeners();
         break;
 
       case gw.GatewayEventType.error:
         final errorMsg = ev.payload['message'] as String? ?? 'Unknown error';
         lastError = errorMsg;
+        _textTurnInFlight = false;
         logger.error('voice.gateway_error', data: {
           'message': errorMsg,
         });
@@ -485,12 +1071,19 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
 
     // Stop timers
     _sendLoopTimer?.cancel();
-    _playbackDrainTimer?.cancel();
+    _playbackClock?.stop();
+    _playbackClock = null;
     _serverReadyTimer?.cancel();
     _reconnectTimer?.cancel();
+    _silenceDetectionTimer?.cancel();
+    _audioStopTimer?.cancel();
+
+    // Finalize playback state machine
+    _audioPlaybackState = AudioPlaybackState.idle;
 
     // Cancel subscriptions
     await _gatewayEventSub?.cancel();
+    await _messageStreamSub?.cancel();
 
     // Clear state
     _sessionActive = false;
@@ -498,6 +1091,8 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
     _audioQueue.clear();
     _playbackBuffer.clear();
     _vad.reset();
+    _inUserUtterance = false;
+    _silenceFramesAfterSpeech = 0;
 
     // Stop audio
     try {
@@ -522,9 +1117,590 @@ class VoiceSessionControllerV2 extends ChangeNotifier {
     logger.info('voice.cleanup_complete');
   }
 
+  /// Initialize conversation for the session
+  Future<void> _initializeConversation() async {
+    try {
+      logger.info('voice.conversation_initializing');
+
+      _activeConversation =
+          await _conversationRepo.getOrCreateActiveConversation(
+        title: 'Voice Conversation ${DateTime.now().toLocal()}',
+      );
+
+      logger.info('voice.conversation_created', data: {
+        'conversation_id': _activeConversation!.id,
+      });
+
+      // Load existing messages
+      final existingMessages = await _conversationRepo.getMessages(
+        _activeConversation!.id,
+      );
+      _messages.clear();
+      _messages.addAll(existingMessages);
+
+      logger.info('voice.messages_loaded', data: {
+        'count': existingMessages.length,
+      });
+
+      // Subscribe to real-time updates
+      await _messageStreamSub?.cancel();
+      _messageStreamSub = _conversationRepo
+          .streamMessages(_activeConversation!.id)
+          .listen((messages) {
+        _mergeMessagesFromStream(messages);
+      });
+
+      logger.info('voice.conversation_initialized', data: {
+        'conversation_id': _activeConversation!.id,
+        'message_count': _messages.length,
+      });
+    } catch (e) {
+      logger.error('voice.conversation_init_failed', error: e);
+      // Continue without conversation persistence
+      _activeConversation = null;
+    }
+  }
+
+  /// Add message to conversation
+  Future<void> _addMessageToConversation({
+    required MessageRole role,
+    required String content,
+    MessageStatus status = MessageStatus.sent,
+    String? id,
+    DateTime? createdAt,
+  }) async {
+    if (_activeConversation == null) {
+      logger.warn('voice.no_active_conversation', data: {
+        'role': role.value,
+        'attempting_reinit': true,
+      });
+      // Try to reinitialize conversation
+      await _initializeConversation();
+      if (_activeConversation == null) {
+        logger.error('voice.conversation_reinit_failed');
+        return;
+      }
+    }
+
+    if (content.trim().isEmpty) return;
+
+    try {
+      final message = await _conversationRepo.addMessage(
+        conversationId: _activeConversation!.id,
+        role: role,
+        content: content,
+        status: status,
+        id: id,
+        createdAt: createdAt,
+      );
+
+      _upsertMessageInMemory(message);
+      logger.info('voice.message_added', data: {
+        'role': role.value,
+        'content_length': content.length,
+        'conversation_id': _activeConversation!.id,
+      });
+    } catch (e) {
+      logger.error('voice.message_add_failed', error: e);
+    }
+  }
+
+  Future<void> _addOptimisticMessage({
+    required MessageRole role,
+    required String content,
+  }) async {
+    if (_activeConversation == null) {
+      await _initializeConversation();
+      if (_activeConversation == null) return;
+    }
+
+    final now = _nextMessageTimestamp();
+    final localId = _localUuid.v4();
+
+    final optimistic = ChatMessage(
+      id: localId,
+      conversationId: _activeConversation!.id,
+      role: role,
+      content: content,
+      timestamp: now,
+      status: MessageStatus.sending,
+    );
+
+    _upsertMessageInMemory(optimistic);
+
+    try {
+      final persisted = await _conversationRepo.addMessage(
+        conversationId: _activeConversation!.id,
+        role: role,
+        content: content,
+        status: MessageStatus.sent,
+        id: localId,
+        createdAt: now,
+      );
+
+      _upsertMessageInMemory(persisted);
+    } catch (e) {
+      _upsertMessageInMemory(
+        optimistic.copyWith(status: MessageStatus.error),
+      );
+      logger.error('voice.message_add_failed', error: e);
+    }
+  }
+
+  Future<void> _persistAssistantMessage(String text) async {
+    final cleaned = text.trim();
+    if (cleaned.isEmpty) return;
+
+    // If we receive multiple transcriptFinal events for the same turn, prefer updating
+    // the last assistant message instead of creating duplicates.
+    final now = _nextMessageTimestamp();
+    final recent = _lastAssistantMessageAt != null &&
+        now.difference(_lastAssistantMessageAt!).inSeconds <= 20;
+
+    final canUpdateExisting = recent &&
+        _lastAssistantMessageId != null &&
+        _lastAssistantMessageText.isNotEmpty &&
+        (cleaned == _lastAssistantMessageText ||
+            cleaned.startsWith(_lastAssistantMessageText) ||
+            _lastAssistantMessageText.startsWith(cleaned));
+
+    if (canUpdateExisting) {
+      // Skip no-op duplicates
+      if (cleaned == _lastAssistantMessageText) return;
+
+      try {
+        await updateMessageContent(
+          messageId: _lastAssistantMessageId!,
+          newContent: cleaned,
+        );
+        _lastAssistantMessageText = cleaned;
+        _lastAssistantMessageAt = now;
+        return;
+      } catch (_) {
+        // If update fails, fall back to insert.
+      }
+    }
+
+    try {
+      if (_activeConversation == null) {
+        // Ensure we have a conversation before attempting to persist
+        await _initializeConversation();
+      }
+      if (_activeConversation == null) return;
+
+      final messageId = _localUuid.v4();
+      final optimistic = ChatMessage(
+        id: messageId,
+        conversationId: _activeConversation!.id,
+        role: MessageRole.assistant,
+        content: cleaned,
+        timestamp: now,
+        status: MessageStatus.sending,
+      );
+
+      _upsertMessageInMemory(optimistic);
+
+      final message = await _conversationRepo.addMessage(
+        conversationId: _activeConversation!.id,
+        role: MessageRole.assistant,
+        content: cleaned,
+        status: MessageStatus.sent,
+        id: messageId,
+        createdAt: now,
+      );
+
+      _upsertMessageInMemory(message);
+      _lastAssistantMessageId = message.id;
+      _lastAssistantMessageText = cleaned;
+      _lastAssistantMessageAt = now;
+
+      logger.info('voice.assistant_message_persisted', data: {
+        'content_length': cleaned.length,
+        'conversation_id': _activeConversation!.id,
+      });
+    } catch (e) {
+      logger.error('voice.assistant_message_persist_failed', error: e);
+    }
+  }
+
+  void setUserDraftEditing(bool editing) {
+    if (isUserDraftEditing == editing) return;
+    isUserDraftEditing = editing;
+    notifyListeners();
+  }
+
+  void updateUserDraftText(String text) {
+    userDraftText = text;
+    notifyListeners();
+  }
+
+  /// Toggle between audio mode (voice input) and text-only mode
+  void setAudioModeEnabled(bool enabled) {
+    if (_isAudioModeEnabled == enabled) return;
+    _isAudioModeEnabled = enabled;
+    logger.info('voice.audio_mode_toggled', data: {
+      'enabled': enabled,
+    });
+    notifyListeners();
+  }
+
+  Future<void> sendUserDraftMessage() async {
+    final content = userDraftText.trim();
+    if (content.isEmpty) return;
+
+    if (_textTurnInFlight) {
+      logger.warn('voice.text_turn_blocked_in_flight');
+      return;
+    }
+
+    final now = DateTime.now();
+    if (_lastSentUserText == content &&
+        _lastSentUserAt != null &&
+        now.difference(_lastSentUserAt!).inSeconds <= 5) {
+      logger.warn('voice.text_turn_blocked_duplicate');
+      return;
+    }
+
+    _textTurnInFlight = true;
+    _lastSentUserText = content;
+    _lastSentUserAt = now;
+
+    // Ensure gateway/session is ready before sending text turn
+    if (!gateway.isConnected || !_serverReady) {
+      lastError = 'Session not ready yet. Please wait a moment and try again.';
+      logger.warn('voice.text_turn_rejected_not_ready', data: {
+        'gateway_connected': gateway.isConnected,
+        'server_ready': _serverReady,
+      });
+      _textTurnInFlight = false;
+      notifyListeners();
+      return;
+    }
+
+    // Clear draft immediately so UI doesn't re-populate while sending
+    userDraftText = '';
+    userTranscriptPartial = '';
+    userTranscriptFinal = '';
+    _liveUserTranscript = '';
+    _lastCommittedTranscript = '';
+    isUserDraftEditing = false;
+    notifyListeners();
+
+    await _addOptimisticMessage(
+      role: MessageRole.user,
+      content: content,
+    );
+
+    // If the mic is still running, stop it so the next turn starts cleanly.
+    if (_uiState == VoiceUiState.listening) {
+      stopMicCapture();
+    }
+
+    // Log which path is being taken
+    logger.info('voice.text_turn_sending', data: {
+      'audio_mode': _isAudioModeEnabled,
+      'content_length': content.length,
+    });
+
+    // Trigger AI response based on edited text
+    try {
+      await gateway.sendTextTurn(
+        content,
+        conversationId: _activeConversation?.id,
+      );
+      // Only set thinking if send was successful
+      _setState(VoiceUiState.thinking);
+    } catch (e) {
+      _textTurnInFlight = false;
+      logger.error('voice.text_turn_send_failed', error: e);
+      _setState(VoiceUiState.error);
+    }
+
+    notifyListeners();
+  }
+
+  void clearUserDraft() {
+    userDraftText = '';
+    userTranscriptPartial = '';
+    userTranscriptFinal = '';
+    _liveUserTranscript = '';
+    _lastCommittedTranscript = ''; // Reset committed tracker
+    isUserDraftEditing = false;
+    notifyListeners();
+  }
+
+  void toggleAiMute() {
+    _aiMuted = !_aiMuted;
+    if (_aiMuted) {
+      // Muting: finalize playback immediately
+      _audioStopTimer?.cancel();
+      _finalizePlayback();
+      logger.info('voice.ai_muted');
+    } else {
+      // Unmuting: reset buffer state so it can start fresh
+      _playbackBuffer.resetForTurn();
+      logger.info('voice.ai_unmuted');
+    }
+    notifyListeners();
+  }
+
+  DateTime _nextMessageTimestamp() {
+    var now = DateTime.now().toUtc();
+    if (_lastMessageTimestamp != null && !now.isAfter(_lastMessageTimestamp!)) {
+      now = _lastMessageTimestamp!.add(const Duration(milliseconds: 1));
+    }
+    _lastMessageTimestamp = now;
+    return now;
+  }
+
+  void _applyUserTranscriptUpdate(String newText, {required bool isFinal}) {
+    if (newText.isEmpty) return;
+
+    logger.info('voice.apply_transcript_update', data: {
+      'new_text_length': newText.length,
+      'is_final': isFinal,
+      'current_draft_length': userDraftText.length,
+      'is_user_editing': isUserDraftEditing,
+    });
+
+    final previousLive = _liveUserTranscript;
+    _liveUserTranscript = newText;
+
+    if (isFinal) {
+      // FINAL transcript - commit it to the accumulated draft
+      // Only add text that hasn't been committed yet
+      final uncommittedText = _extractDelta(_lastCommittedTranscript, newText);
+
+      if (uncommittedText.isNotEmpty) {
+        if (isUserDraftEditing) {
+          // If user is editing, append carefully
+          userDraftText = _mergeTranscript(userDraftText, uncommittedText);
+        } else {
+          // Append the new final text to accumulated draft
+          userDraftText = _mergeTranscript(userDraftText, uncommittedText);
+        }
+
+        // Mark this text as committed
+        _lastCommittedTranscript = newText;
+
+        logger.info('voice.final_transcript_committed', data: {
+          'new_text': uncommittedText,
+          'full_draft': userDraftText,
+        });
+      }
+
+      userTranscriptFinal = newText;
+      userTranscriptPartial = newText; // Show final as partial for smooth UX
+    } else {
+      // PARTIAL transcript - just show it live, don't commit to draft yet
+      // Display the partial for real-time feedback
+      userTranscriptPartial = newText;
+
+      logger.debug('voice.partial_transcript_received', data: {
+        'text': newText,
+      });
+    }
+  }
+
+  String _extractDelta(String previous, String current) {
+    if (previous.isEmpty) return current;
+    if (current.startsWith(previous)) {
+      return current.substring(previous.length).trimLeft();
+    }
+    return current;
+  }
+
+  /// Merge two transcript fragments
+  String _mergeTranscript(String existing, String incoming) {
+    final trimmedExisting = existing.trim();
+    final trimmedIncoming = incoming.trim();
+    if (trimmedExisting.isEmpty) return trimmedIncoming;
+    if (trimmedIncoming.isEmpty) return trimmedExisting;
+
+    final needsSpace = !trimmedExisting.endsWith(' ') &&
+        !trimmedExisting.endsWith('\n') &&
+        !trimmedExisting.endsWith('.') &&
+        !trimmedExisting.endsWith('!') &&
+        !trimmedExisting.endsWith('?') &&
+        !trimmedExisting.endsWith(',');
+
+    return needsSpace
+        ? '$trimmedExisting $trimmedIncoming'
+        : '$trimmedExisting$trimmedIncoming'; // Fixed: no space when needsSpace is false
+  }
+
+  /// Add or update message in local cache
+  void _upsertMessageInMemory(ChatMessage message) {
+    final index = _messages.indexWhere((m) => m.id == message.id);
+    if (index == -1) {
+      _messages.add(message);
+    } else {
+      _messages[index] = message;
+    }
+    notifyListeners();
+  }
+
+  void _mergeMessagesFromStream(List<ChatMessage> incoming) {
+    if (incoming.isEmpty) {
+      return;
+    }
+
+    final mergedById = <String, ChatMessage>{
+      for (final message in _messages) message.id: message,
+    };
+
+    for (final message in incoming) {
+      mergedById[message.id] = message;
+    }
+
+    final merged = mergedById.values.toList()
+      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+
+    _messages
+      ..clear()
+      ..addAll(merged);
+    notifyListeners();
+  }
+
+  /// Update message content (e.g., user edits transcript)
+  Future<void> updateMessageContent({
+    required String messageId,
+    required String newContent,
+  }) async {
+    if (_activeConversation == null) {
+      logger.warn('voice.update_no_conversation');
+      return;
+    }
+    if (newContent.trim().isEmpty) return;
+
+    try {
+      logger.info('voice.updating_message', data: {
+        'message_id': messageId,
+        'conversation_id': _activeConversation!.id,
+      });
+
+      final updated = await _conversationRepo.updateMessage(
+        messageId: messageId,
+        content: newContent,
+      );
+
+      _upsertMessageInMemory(updated);
+      logger.info('voice.message_updated', data: {
+        'message_id': messageId,
+        'content_length': newContent.length,
+      });
+    } catch (e) {
+      logger.error('voice.message_update_failed', error: e);
+    }
+  }
+
+  /// Generate and download conversation summary
+  Future<ConversationSummary?> generateSummary() async {
+    if (_activeConversation == null) return null;
+
+    try {
+      return await _conversationRepo.generateSummary(_activeConversation!.id);
+    } catch (e) {
+      logger.error('voice.summary_generation_failed', error: e);
+      return null;
+    }
+  }
+
+  /// Build context for AI with full conversation history
+  String buildConversationContext() {
+    if (_messages.isEmpty) return '';
+
+    final buffer = StringBuffer();
+    buffer.writeln('Previous conversation context:');
+
+    for (final message in _messages) {
+      final speaker = message.role == MessageRole.user ? 'User' : 'Assistant';
+      buffer.writeln('$speaker: ${message.content}');
+    }
+
+    return buffer.toString();
+  }
+
   @override
-  Future<void> dispose() async {
-    await _cleanup();
+  void dispose() {
+    _cleanup();
     super.dispose();
   }
+}
+
+class PlaybackClock {
+  final int frameSamples;
+  final int sampleRate;
+  final VoidCallback onTick;
+
+  Isolate? _isolate;
+  ReceivePort? _receivePort;
+  StreamSubscription? _subscription;
+  SendPort? _controlPort;
+
+  PlaybackClock({
+    required this.frameSamples,
+    required this.sampleRate,
+    required this.onTick,
+  });
+
+  void start() {
+    stop();
+    _receivePort = ReceivePort();
+    _subscription = _receivePort!.listen((message) {
+      if (message is SendPort) {
+        _controlPort = message;
+        return;
+      }
+      if (message == _ClockMessage.tick) {
+        onTick();
+      }
+    });
+
+    Isolate.spawn(_clockIsolate, [
+      _receivePort!.sendPort,
+      frameSamples,
+      sampleRate,
+    ]).then((iso) {
+      _isolate = iso;
+    });
+  }
+
+  void stop() {
+    _controlPort?.send(_ClockMessage.stop);
+    _subscription?.cancel();
+    _subscription = null;
+    _receivePort?.close();
+    _receivePort = null;
+    _isolate?.kill(priority: Isolate.immediate);
+    _isolate = null;
+    _controlPort = null;
+  }
+
+  static void _clockIsolate(List<dynamic> args) {
+    final SendPort sendPort = args[0] as SendPort;
+    final int frameSamples = args[1] as int;
+    final int sampleRate = args[2] as int;
+    final controlPort = ReceivePort();
+
+    sendPort.send(controlPort.sendPort);
+
+    final frameDurationUs = (frameSamples * 1000000 / sampleRate).round();
+    final timer = Timer.periodic(
+      Duration(microseconds: frameDurationUs),
+      (_) => sendPort.send(_ClockMessage.tick),
+    );
+
+    controlPort.listen((message) {
+      if (message == _ClockMessage.stop) {
+        timer.cancel();
+        controlPort.close();
+      }
+    });
+  }
+}
+
+class _ClockMessage {
+  static const String tick = 'tick';
+  static const String stop = 'stop';
 }

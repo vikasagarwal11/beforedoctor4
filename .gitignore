@@ -33,6 +33,14 @@ migrate_working_dir/
 .pub/
 /build/
 
+# Python virtual environments
+.venv/
+.venv*/
+venv/
+**/.venv/
+**/.venv*/
+**/venv/
+
 # Symbolication related
 app.*.symbols
 

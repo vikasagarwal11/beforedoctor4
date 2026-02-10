@@ -1,8 +1,0 @@
-Changing current working directory to: /Users/ainarai/Desktop/Vikas/beforedoctor4/beforedoctor4
-No devices found yet. Checking for wireless devices...
-
-No supported devices found with name or id matching 'ios'.
-
-The following devices were found:
-macOS (desktop) • macos  • darwin-arm64   • macOS 15.7.3 24G419 darwin-arm64
-Chrome (web)    • chrome • web-javascript • Google Chrome 143.0.7499.193

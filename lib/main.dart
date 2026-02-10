@@ -1,29 +1,26 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'firebase_options.dart';
 
 import 'app/app_shell.dart';
+import 'core/supabase/supabase_config.dart';
 import 'core/theme/app_theme.dart';
 import 'data/repositories/mock_repo.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  
-  // Initialize Firebase with explicit options (FlutterFire CLI approach)
-  // This enables multi-platform support and fixes Android configuration
+
+  // Initialize Supabase (replaces Firebase)
   try {
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-    print('✅ Firebase initialized successfully');
+    await SupabaseConfig.initialize();
+    print('✅ Supabase initialized successfully');
+    print('   URL: ${SupabaseConfig.supabaseUrl}');
   } catch (e) {
-    // Firebase not configured - this should not happen in production
-    print('❌ Firebase initialization failed: $e');
-    print('   Please ensure firebase_options.dart is generated correctly');
-    print('   App authentication will fail without Firebase');
+    // Supabase initialization failed - app cannot work without it
+    print('❌ Supabase initialization failed: $e');
+    print('   Please check your Supabase configuration');
+    print('   App authentication and storage will not work');
   }
-  
+
   runApp(ProviderScope(child: MyApp(repo: MockRepo.bootstrap())));
 }
 

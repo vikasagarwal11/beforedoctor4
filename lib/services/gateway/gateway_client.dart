@@ -21,14 +21,17 @@ abstract class IGatewayClient {
 
   Future<void> connect({
     required Uri url,
-    required String firebaseIdToken,
+    required String
+        firebaseIdToken, // Keep parameter name for backward compatibility
     required Map<String, dynamic> sessionConfig,
+    String? conversationId, // Optional conversation ID for persistence
   });
 
   Future<void> sendAudioChunkBase64(String base64Pcm16k);
   Future<void> sendAudioChunkBinary(
       Uint8List pcm16k); // Binary WebSocket frames
-  Future<void> sendTurnComplete();
+  Future<void> sendTurnComplete({bool transcribeOnly = false});
+  Future<void> sendTextTurn(String text, {String? conversationId});
   Future<void> sendBargeIn(); // Cancel server-side audio generation
   Future<void> sendStop();
   Future<void> close();
@@ -40,6 +43,7 @@ class GatewayClient implements IGatewayClient {
   bool _connected = false;
   int _connectionSeq = 0;
   bool _intentionalClose = false;
+  Timer? _pingTimer;
 
   @override
   Stream<GatewayEvent> get events => _controller.stream;
@@ -50,8 +54,10 @@ class GatewayClient implements IGatewayClient {
   @override
   Future<void> connect({
     required Uri url,
-    required String firebaseIdToken,
+    required String
+        firebaseIdToken, // Renamed from Firebase to Supabase, but keeping param name
     required Map<String, dynamic> sessionConfig,
+    String? conversationId, // Optional conversation ID for persistence
   }) async {
     await close();
 
@@ -94,6 +100,8 @@ class GatewayClient implements IGatewayClient {
       onDone: () {
         if (conn != _connectionSeq) return;
         _connected = false;
+        _pingTimer?.cancel();
+        _pingTimer = null;
 
         // Only surface a disconnect if it wasn't a user/system initiated close.
         if (!_intentionalClose) {
@@ -113,7 +121,15 @@ class GatewayClient implements IGatewayClient {
     _channel!.sink.add(clientHello(
       firebaseIdToken: firebaseIdToken,
       sessionConfig: sessionConfig,
+      conversationId: conversationId,
     ));
+
+    // Keepalive ping to prevent idle disconnects (ngrok/mobile)
+    _pingTimer?.cancel();
+    _pingTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+      if (_channel == null || !_connected) return;
+      _channel!.sink.add(jsonEncode({'type': 'client.ping', 'payload': {}}));
+    });
   }
 
   @override
@@ -134,11 +150,20 @@ class GatewayClient implements IGatewayClient {
   }
 
   @override
-  Future<void> sendTurnComplete() async {
+  Future<void> sendTurnComplete({bool transcribeOnly = false}) async {
     if (_channel == null || !_connected) {
       throw StateError('Gateway not connected');
     }
-    _channel!.sink.add(clientTurnComplete());
+    _channel!.sink.add(clientTurnComplete(transcribeOnly: transcribeOnly));
+  }
+
+  @override
+  Future<void> sendTextTurn(String text, {String? conversationId}) async {
+    if (_channel == null || !_connected) {
+      throw StateError('Gateway not connected');
+    }
+    _channel!.sink
+        .add(clientTextTurn(text: text, conversationId: conversationId));
   }
 
   @override
@@ -163,6 +188,8 @@ class GatewayClient implements IGatewayClient {
     _intentionalClose = true;
     _connectionSeq++;
     _connected = false;
+    _pingTimer?.cancel();
+    _pingTimer = null;
     await _channel?.sink.close();
     _channel = null;
   }

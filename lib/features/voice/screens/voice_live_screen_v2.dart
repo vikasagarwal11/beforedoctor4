@@ -1,16 +1,18 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../../../core/constants/tokens.dart';
 import '../../../services/audio/native_audio_engine.dart';
 import '../../../services/audio/vad_processor.dart';
 import '../../../services/gateway/gateway_client.dart';
+import '../../../services/gateway/mock_gateway_client.dart';
 import '../../../services/logging/app_logger.dart';
 import '../voice_session_controller_v2.dart';
-import '../widgets/mic_button.dart';
-import '../widgets/waveform_bars.dart';
+import '../widgets/chat_message_list.dart';
 
 class VoiceLiveScreenV2 extends StatefulWidget {
   final Uri gatewayUrl;
@@ -34,10 +36,11 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
     with TickerProviderStateMixin {
   late VoiceSessionControllerV2 _controller;
   late AnimationController _auraController;
-  Timer? _authFailsafeTimer;
+  final TextEditingController _textController = TextEditingController();
+  final FocusNode _textFocusNode = FocusNode();
 
   final AppLogger _logger = AppLogger.instance;
-  bool _startTriggered = false;
+  bool _updatingFromController = false; // Prevent circular updates
 
   @override
   void initState() {
@@ -49,7 +52,8 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
     )..repeat(reverse: true);
 
     // Initialize controller
-    final gateway = GatewayClient();
+    final gateway =
+      widget.useMockGateway ? MockGatewayClient() : GatewayClient();
     final audio = NativeAudioEngine();
 
     _controller = VoiceSessionControllerV2(
@@ -60,53 +64,127 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
 
     _controller.addListener(_onControllerUpdate);
 
-    // Only auto-start if token is already available (normally won't be in initState)
-    _triggerStartIfPossible();
+    // Sync voice transcript to text field (never override while user edits)
+    _controller.addListener(() {
+      // Do not overwrite if user is actively editing non-empty text.
+      if (_textFocusNode.hasFocus && _textController.text.trim().isNotEmpty) {
+        _logger.debug('voice.transcript_update_blocked_user_editing', data: {
+          'has_focus': _textFocusNode.hasFocus,
+          'text_length': _textController.text.length,
+        });
+        return;
+      }
 
-    // FAILSAFE: If token doesn't arrive within 3 seconds, proceed anyway
-    // This prevents stuck "Authenticating..." screen
-    _authFailsafeTimer?.cancel();
-    _authFailsafeTimer = Timer(const Duration(seconds: 3), () {
-      if (!_startTriggered && mounted && widget.firebaseIdToken.isEmpty) {
-        _logger.warn('voice.token_timeout_proceeding_without_token');
+      // Show accumulated draft + live partial transcript
+      String displayText = _controller.userDraftText;
+
+      // If listening and there's a partial, append it for live preview
+      if (_controller.uiState == VoiceUiState.listening &&
+          _controller.userTranscriptPartial.isNotEmpty) {
+        // Only show partial if it's different from what's already in draft
+        if (!_controller.userDraftText
+            .contains(_controller.userTranscriptPartial)) {
+          final needsSpace = displayText.trim().isNotEmpty;
+          displayText = needsSpace
+              ? '${displayText.trim()} ${_controller.userTranscriptPartial}'
+              : _controller.userTranscriptPartial;
+        }
+      }
+
+      // Only sync if text is different
+      if (displayText != _textController.text) {
+        _logger.debug('voice.text_field_sync', data: {
+          'display_text_length': displayText.length,
+          'previous_length': _textController.text.length,
+        });
+        _updatingFromController = true; // Prevent onChanged from firing
+        _textController.text = displayText;
+        _textController.selection = TextSelection.collapsed(
+          offset: _textController.text.length,
+        );
+        _updatingFromController = false;
       }
     });
+
+    // Track manual editing state
+    _textFocusNode.addListener(() {
+      _controller.setUserDraftEditing(_textFocusNode.hasFocus);
+    });
+
+    // Connect gateway immediately on screen load (not on mic press)
+    // This eliminates connection delay when user presses mic
+    _initializeSession();
+  }
+
+  Future<void> _initializeSession() async {
+    if (!mounted) return;
+    if (widget.firebaseIdToken.isEmpty) {
+      _logger.warn('voice.firebase_token_empty_on_init');
+      return;
+    }
+
+    try {
+      _logger.info('voice.session_init_starting');
+      await _controller.start(
+        gatewayUrl: widget.gatewayUrl,
+        firebaseIdToken: widget.firebaseIdToken,
+        sessionConfig: widget.sessionConfig,
+      );
+      _logger.info('voice.session_init_success');
+    } catch (e) {
+      _logger.error('voice.session_init_failed', error: e);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to connect: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 
   @override
   void didUpdateWidget(VoiceLiveScreenV2 oldWidget) {
     super.didUpdateWidget(oldWidget);
 
-    // When token becomes available or changes, start the session
+    // When token becomes available or changes, reinitialize session
     if (widget.firebaseIdToken.isNotEmpty &&
         widget.firebaseIdToken != oldWidget.firebaseIdToken) {
-      _authFailsafeTimer?.cancel();
-      _authFailsafeTimer = null;
       _logger.info('voice.token_received',
           data: {'token_length': widget.firebaseIdToken.length});
-      _triggerStartIfPossible();
+      _initializeSession();
     }
-  }
-
-  void _triggerStartIfPossible() {
-    if (!mounted || _startTriggered) return;
-    if (widget.firebaseIdToken.isEmpty) return;
-
-    _startTriggered = true;
-    _authFailsafeTimer?.cancel();
-    _authFailsafeTimer = null;
-
-    // Use Future.microtask to avoid permission dialog conflicts
-    Future.microtask(() => _initializeAndStart());
   }
 
   void _onControllerUpdate() {
     setState(() {}); // Rebuild on controller changes
   }
 
-  Future<void> _initializeAndStart() async {
-    // Guard: Don't initialize if already disposed or session active
+  Future<void> _startAudioCapture() async {
     if (!mounted) return;
+    if (_controller.uiState == VoiceUiState.listening) return;
+
+    _logger.info('voice.mic_button_pressed');
+
+    // Check if session is active
+    if (_controller.uiState == VoiceUiState.idle ||
+        _controller.uiState == VoiceUiState.stopped) {
+      // Session exists, just need permission
+    } else {
+      _logger.warn('voice.session_not_ready', data: {
+        'state': _controller.uiState.toString(),
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Connecting... Please wait'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+      return;
+    }
 
     // Request microphone permission
     final status = await Permission.microphone.request();
@@ -120,43 +198,52 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
       return;
     }
 
-    // Validate token
-    if (widget.firebaseIdToken.isEmpty) {
-      _logger.error('voice.firebase_token_empty');
+    // Start mic capture
+    try {
+      _logger.info('voice.starting_mic_capture');
+      _controller.startMicCapture();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Firebase token required')),
+          const SnackBar(
+            content: Text('🎤 Listening... Speak now'),
+            duration: Duration(seconds: 2),
+            backgroundColor: Color(0xFF6366F1),
+          ),
         );
       }
-      // Allow auto-start later when token arrives.
-      _startTriggered = false;
-      return;
-    }
-
-    // Start session
-    try {
-      await _controller.start(
-        gatewayUrl: widget.gatewayUrl,
-        firebaseIdToken: widget.firebaseIdToken,
-        sessionConfig: widget.sessionConfig,
-      );
     } catch (e) {
-      _logger.error('voice.start_failed', error: e);
+      _logger.error('voice.capture_start_failed', error: e);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to start: $e')),
+          SnackBar(
+            content: Text('Failed to start mic: $e'),
+            backgroundColor: Colors.red,
+          ),
         );
       }
     }
   }
 
+  void _stopMicCapture() {
+    _logger.info('voice.stopping_mic_capture');
+    _controller.stopMicCapture();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Mic stopped'),
+          duration: Duration(seconds: 1),
+        ),
+      );
+    }
+  }
+
   @override
   void dispose() {
-    _authFailsafeTimer?.cancel();
-    _authFailsafeTimer = null;
     _controller.removeListener(_onControllerUpdate);
     _auraController.dispose();
-    unawaited(_controller.dispose());
+    _textController.dispose();
+    _textFocusNode.dispose();
+    _controller.dispose();
     super.dispose();
   }
 
@@ -215,101 +302,176 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
     }
 
     return Scaffold(
-      extendBodyBehindAppBar: true,
       appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        title: const Text('Live Voice'),
+        title: const Text('Chat'),
         actions: [
           IconButton(
-            tooltip: 'Debug',
-            onPressed: _showDebugSheet,
-            icon: const Icon(Icons.tune_rounded),
-          ),
-        ],
-      ),
-      body: Stack(
-        children: [
-          _BackgroundGlow(
-              color: _statusColor(context), animation: _auraController),
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(
-                  AppTokens.lg, AppTokens.md, AppTokens.lg, AppTokens.lg),
-              child: Column(
-                children: [
-                  _buildTopBar(context),
-                  const SizedBox(height: AppTokens.lg),
-                  Expanded(
-                    child: ListView(
-                      padding: EdgeInsets.zero,
-                      children: [
-                        _buildErrorBanner(context),
-                        const SizedBox(height: AppTokens.md),
-                        Center(
-                          child: MicButton(
-                            state: _controller.uiState,
-                            onPressed: () {
-                              final isStopped = _controller.uiState ==
-                                      VoiceUiState.stopped ||
-                                  _controller.uiState == VoiceUiState.idle ||
-                                  _controller.uiState == VoiceUiState.error;
-                              if (isStopped) {
-                                _initializeAndStart();
-                              } else {
-                                _stopSession();
-                              }
-                            },
-                          ),
-                        ),
-                        const SizedBox(height: AppTokens.lg),
-                        _TranscriptCard(
-                          title: 'You',
-                          tone: _TranscriptTone.user,
-                          text: _controller.userTranscriptFinal.isNotEmpty
-                              ? _controller.userTranscriptFinal
-                              : _controller.userTranscriptPartial,
-                          placeholder: _controller.uiState ==
-                                  VoiceUiState.listening
-                              ? 'Speak naturally… I’ll transcribe as you talk.'
-                              : 'Waiting for your voice…',
-                          isPartial: _controller.userTranscriptFinal.isEmpty &&
-                              _controller.userTranscriptPartial.isNotEmpty,
-                        ),
-                        const SizedBox(height: AppTokens.md),
-                        _TranscriptCard(
-                          title: 'Assistant',
-                          tone: _TranscriptTone.assistant,
-                          text: _controller.assistantTextFinal.isNotEmpty
-                              ? _controller.assistantTextFinal
-                              : _controller.assistantTextPartial,
-                          placeholder:
-                              _controller.uiState == VoiceUiState.thinking
-                                  ? 'Thinking…'
-                                  : _controller.uiState == VoiceUiState.speaking
-                                      ? 'Speaking…'
-                                      : 'Ready when you are.',
-                          isPartial: _controller.assistantTextFinal.isEmpty &&
-                              _controller.assistantTextPartial.isNotEmpty,
-                        ),
-                        const SizedBox(height: AppTokens.md),
-                        WaveformBars(
-                          mode: _controller.uiState == VoiceUiState.listening
-                              ? WaveformMode.listening
-                              : _controller.uiState == VoiceUiState.thinking
-                                  ? WaveformMode.thinking
-                                  : WaveformMode.idle,
-                        ),
-                        const SizedBox(height: AppTokens.lg),
-                        _buildQuickActions(context),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
+            tooltip: _controller.isAiMuted ? 'Unmute' : 'Mute',
+            onPressed: () => _controller.toggleAiMute(),
+            icon: Icon(
+              _controller.isAiMuted
+                  ? Icons.volume_off_rounded
+                  : Icons.volume_up_rounded,
             ),
           ),
         ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            _buildErrorBanner(context),
+            Expanded(
+              child: Container(
+                color: cs.surface,
+                child: ChatMessageList(
+                  messages: _controller.messages,
+                  userPartialText: null,
+                  userDraftText: null,
+                  userDraftEditing: false,
+                  showDraftPlaceholder: false,
+                  onDraftEditingChanged: null,
+                  onDraftChanged: null,
+                  onDraftSend: null,
+                  assistantPartialText: _controller.assistantTextPartial.isEmpty
+                      ? null
+                      : _controller.assistantTextPartial,
+                  showAssistantTyping:
+                      (_controller.uiState == VoiceUiState.thinking ||
+                              _controller.uiState == VoiceUiState.speaking) &&
+                          _controller.assistantTextPartial.isEmpty &&
+                          !_controller.isTranscribingPending,
+                  showUserTyping: _controller.isTranscribingPending,
+                  userTypingLabel: _controller.isTranscribingPending
+                      ? 'Transcribing…'
+                      : null,
+                  assistantTypingLabel: (_controller.uiState ==
+                                  VoiceUiState.thinking ||
+                              _controller.uiState == VoiceUiState.speaking) &&
+                          !_controller.isTranscribingPending
+                      ? 'Thinking…'
+                      : null,
+                  onMessageEdit: (messageId, newContent) {
+                    _controller.updateMessageContent(
+                      messageId: messageId,
+                      newContent: newContent,
+                    );
+                  },
+                ),
+              ),
+            ),
+            Container(
+              decoration: BoxDecoration(
+                color: cs.surface,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.08),
+                    blurRadius: 12,
+                    offset: const Offset(0, -2),
+                  ),
+                ],
+              ),
+              child: SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.all(AppTokens.md),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Container(
+                          constraints: const BoxConstraints(
+                            maxHeight: 200,
+                          ),
+                          child: SingleChildScrollView(
+                            child: Container(
+                              decoration: BoxDecoration(
+                                color: cs.surfaceContainerHighest,
+                                borderRadius: BorderRadius.circular(24),
+                                border: Border.all(
+                                  color: cs.outline.withOpacity(0.2),
+                                ),
+                              ),
+                              child: TextField(
+                                controller: _textController,
+                                focusNode: _textFocusNode,
+                                maxLines: 6,
+                                minLines: 1,
+                                textCapitalization:
+                                    TextCapitalization.sentences,
+                                onChanged: (text) {
+                                  if (!_updatingFromController) {
+                                    _controller.updateUserDraftText(text);
+                                  }
+                                },
+                                style: Theme.of(context).textTheme.bodyLarge,
+                                decoration: InputDecoration(
+                                  hintText: _getInputHint(),
+                                  hintStyle: TextStyle(
+                                      color:
+                                          cs.onSurfaceVariant.withOpacity(0.6)),
+                                  border: InputBorder.none,
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: AppTokens.lg,
+                                    vertical: AppTokens.md,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: AppTokens.sm),
+                      _textController.text.trim().isEmpty
+                          ? GestureDetector(
+                              onTap: () {
+                                if (_controller.uiState ==
+                                    VoiceUiState.listening) {
+                                  _stopMicCapture();
+                                } else {
+                                  _startAudioCapture();
+                                }
+                              },
+                              child: Container(
+                                width: 56,
+                                height: 56,
+                                decoration: BoxDecoration(
+                                  color: _controller.uiState ==
+                                          VoiceUiState.listening
+                                      ? const Color(0xFFEF4444)
+                                      : cs.primary,
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Icon(
+                                  _controller.uiState == VoiceUiState.listening
+                                      ? Icons.stop_rounded
+                                      : Icons.mic_rounded,
+                                  color: Colors.white,
+                                  size: 28,
+                                ),
+                              ),
+                            )
+                          : GestureDetector(
+                              onTap: _sendTextMessage,
+                              child: Container(
+                                width: 56,
+                                height: 56,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF10B981),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: const Icon(
+                                  Icons.send_rounded,
+                                  color: Colors.white,
+                                  size: 24,
+                                ),
+                              ),
+                            ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -337,7 +499,8 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
             ],
           ),
         ),
-        _StatusChip(state: _controller.uiState),
+        // Status chip hidden - user doesn't want to see technical states
+        const SizedBox.shrink(),
       ],
     );
   }
@@ -398,35 +561,57 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
 
   Widget _buildQuickActions(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    return Row(
+    return Column(
       children: [
-        Expanded(
-          child: OutlinedButton.icon(
-            onPressed: _showDebugSheet,
-            icon: const Icon(Icons.bar_chart_rounded),
-            label: const Text('Metrics'),
-            style: OutlinedButton.styleFrom(
-              backgroundColor: cs.surface.withOpacity(0.55),
-              side: BorderSide(color: cs.outlineVariant.withOpacity(0.6)),
-              padding: const EdgeInsets.symmetric(vertical: AppTokens.md),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(AppTokens.rLg),
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _showDebugSheet,
+                icon: const Icon(Icons.bar_chart_rounded),
+                label: const Text('Metrics'),
+                style: OutlinedButton.styleFrom(
+                  backgroundColor: cs.surface.withOpacity(0.55),
+                  side: BorderSide(color: cs.outlineVariant.withOpacity(0.6)),
+                  padding: const EdgeInsets.symmetric(vertical: AppTokens.md),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(AppTokens.rLg),
+                  ),
+                ),
               ),
             ),
-          ),
+            const SizedBox(width: AppTokens.md),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _controller.uiState != VoiceUiState.stopped
+                    ? _stopSession
+                    : null,
+                icon: const Icon(Icons.stop_circle_outlined),
+                label: const Text('Stop'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: cs.error,
+                  backgroundColor: cs.surface.withOpacity(0.55),
+                  side: BorderSide(color: cs.error.withOpacity(0.35)),
+                  padding: const EdgeInsets.symmetric(vertical: AppTokens.md),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(AppTokens.rLg),
+                  ),
+                ),
+              ),
+            ),
+          ],
         ),
-        const SizedBox(width: AppTokens.md),
-        Expanded(
-          child: OutlinedButton.icon(
-            onPressed: _controller.uiState != VoiceUiState.stopped
-                ? _stopSession
-                : null,
-            icon: const Icon(Icons.stop_circle_outlined),
-            label: const Text('Stop'),
-            style: OutlinedButton.styleFrom(
-              foregroundColor: cs.error,
-              backgroundColor: cs.surface.withOpacity(0.55),
-              side: BorderSide(color: cs.error.withOpacity(0.35)),
+        const SizedBox(height: AppTokens.md),
+        SizedBox(
+          width: double.infinity,
+          child: ElevatedButton.icon(
+            onPressed:
+                _controller.messages.isNotEmpty ? _downloadSummary : null,
+            icon: const Icon(Icons.download_rounded),
+            label: const Text('Download Summary'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: cs.primaryContainer,
+              foregroundColor: cs.onPrimaryContainer,
               padding: const EdgeInsets.symmetric(vertical: AppTokens.md),
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(AppTokens.rLg),
@@ -481,8 +666,7 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
                 _KeyValueRow(
                     label: 'Audio out chunks',
                     value: _controller.receivedAudioChunks.toString()),
-                _KeyValueRow(
-                    label: 'Gateway', value: widget.gatewayUrl.toString()),
+                const _KeyValueRow(label: 'Backend', value: 'Supabase'),
                 const SizedBox(height: AppTokens.lg),
               ],
             ),
@@ -502,6 +686,139 @@ class _VoiceLiveScreenV2State extends State<VoiceLiveScreenV2>
       }
     } catch (e) {
       _logger.error('voice.stop_failed', error: e);
+    }
+  }
+
+  String _getStatusText() {
+    // Always show simple status - no technical states visible to user
+    return 'Online';
+  }
+
+  String _getInputHint() {
+    // Simple hint - no technical state mentions
+    if (_textController.text.isNotEmpty) {
+      return '';
+    } else {
+      return 'Type a message or tap mic';
+    }
+  }
+
+  void _sendTextMessage() {
+    final text = _textController.text.trim();
+    if (text.isEmpty) return;
+
+    // End the audio turn cleanly if the mic is still running.
+    if (_controller.uiState == VoiceUiState.listening) {
+      _controller.stopMicCapture();
+    }
+
+    // Send message through controller (this will save it)
+    _controller.sendUserDraftMessage();
+
+    // Clear the text field UI
+    _updatingFromController = true;
+    _textController.clear();
+    _updatingFromController = false;
+
+    // Clear input field
+    _textController.clear();
+    _textFocusNode.unfocus();
+  }
+
+  Future<void> _downloadSummary() async {
+    try {
+      // Show loading
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Row(
+            children: [
+              SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              SizedBox(width: 12),
+              Text('Generating summary...'),
+            ],
+          ),
+          duration: Duration(seconds: 2),
+        ),
+      );
+
+      // Generate summary
+      final summary = await _controller.generateSummary();
+
+      if (summary == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Failed to generate summary'),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return;
+      }
+
+      // Format as readable text
+      final summaryText = summary.toReadableText();
+
+      // Copy to clipboard
+      await Clipboard.setData(ClipboardData(text: summaryText));
+
+      if (!mounted) return;
+
+      // Show options dialog
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Summary Ready'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Your conversation summary has been copied to clipboard.',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                '${summary.keyPoints.length} key points identified',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+            FilledButton.icon(
+              onPressed: () {
+                Navigator.of(context).pop();
+                Share.share(
+                  summaryText,
+                  subject: 'Conversation Summary',
+                );
+              },
+              icon: const Icon(Icons.share),
+              label: const Text('Share'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      _logger.error('voice.summary_download_failed', error: e);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
   }
 }

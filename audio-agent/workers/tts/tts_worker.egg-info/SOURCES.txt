@@ -1,0 +1,9 @@
+pyproject.toml
+tts_worker/__init__.py
+tts_worker/app.py
+tts_worker/service.py
+tts_worker.egg-info/PKG-INFO
+tts_worker.egg-info/SOURCES.txt
+tts_worker.egg-info/dependency_links.txt
+tts_worker.egg-info/requires.txt
+tts_worker.egg-info/top_level.txt
